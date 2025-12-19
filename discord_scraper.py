@@ -15,12 +15,12 @@ from playwright.async_api import async_playwright, Page, Browser
 
 
 class DiscordScraper:
-    def __init__(self, target_username: str = "Mams [τ, ꨄ]", target_server: str = "bittensor", headless: bool = False, scrape_unread_only: bool = True):
+    def __init__(self, target_username: str = "consτ [τ, τ]", target_server: str = "bittensor", headless: bool = False, scrape_unread_only: bool = True):
         """
         Initialize the Discord scraper.
         
         Args:
-            target_username: The username to filter messages for (default: "D&C")
+            target_username: The username to filter messages for (default: "consτ [τ, τ]")
             target_server: The server name to scrape (default: "bittensor")
             headless: Whether to run browser in headless mode
             scrape_unread_only: Only scrape unread messages (default: True) - faster and avoids duplicates
@@ -1175,6 +1175,28 @@ class DiscordScraper:
         except:
             return False
     
+    async def find_unread_marker_position(self):
+        """Find the position of the unread marker in the message view."""
+        try:
+            unread_marker_selectors = [
+                'div[class*="newMessagesBar"]',
+                'div[class*="unreadBar"]',
+                'div[class*="newMessages"]',
+                'div[aria-label*="New messages"]',
+                'div[aria-label*="new messages"]'
+            ]
+            
+            for selector in unread_marker_selectors:
+                marker = await self.page.query_selector(selector)
+                if marker:
+                    # Get marker position
+                    box = await marker.bounding_box()
+                    if box:
+                        return box['y']
+            return None
+        except:
+            return None
+    
     async def scroll_to_load_unread_messages(self, max_scrolls: int = 10):
         """
         Handle scrolling for unread messages.
@@ -1187,7 +1209,8 @@ class DiscordScraper:
             message_container_selectors = [
                 '[class*="messages"]',
                 '[class*="scroller"]',
-                '[class*="messageContainer"]'
+                '[class*="messageContainer"]',
+                'div[class*="scrollerInner"]'
             ]
             
             message_container = None
@@ -1207,26 +1230,57 @@ class DiscordScraper:
             if not message_container:
                 return
             
-            # Wait a moment for Discord to auto-scroll to unread messages (if many unread)
-            await asyncio.sleep(1)
+            # Wait longer for Discord to auto-scroll to unread messages (if many unread)
+            await asyncio.sleep(2)
             
             # Check if we're already at unread messages (Discord auto-scrolled)
             has_unread_marker = await self.has_unread_messages_in_view()
             
             if has_unread_marker:
-                print(f"  📬 Discord auto-scrolled to unread messages (many unread)")
-                # We're already at unread messages, just scroll down a bit to load more
-                await message_container.evaluate('element => element.scrollTop += 500')
-                await asyncio.sleep(0.3)
+                print(f"  📬 Found unread marker - Discord auto-scrolled to unread messages")
+                
+                # Find the unread marker position
+                marker_y = await self.find_unread_marker_position()
+                
+                if marker_y:
+                    # Scroll to position slightly above the marker to load messages before it
+                    container_box = await message_container.bounding_box()
+                    if container_box:
+                        container_y = container_box['y']
+                        relative_y = marker_y - container_y
+                        # Scroll to show messages around the marker
+                        await message_container.evaluate(f'el => el.scrollTop = {max(0, relative_y - 200)}')
+                        await asyncio.sleep(0.5)
+                
+                # Scroll down from marker to load all unread messages
+                for i in range(5):  # Scroll down a few times to load unread messages
+                    current_scroll = await message_container.evaluate('el => el.scrollTop')
+                    scroll_height = await message_container.evaluate('el => el.scrollHeight')
+                    client_height = await message_container.evaluate('el => el.clientHeight')
+                    
+                    # If we're near the bottom, stop
+                    if current_scroll + client_height >= scroll_height - 50:
+                        break
+                    
+                    # Scroll down
+                    await message_container.evaluate('el => el.scrollTop += 400')
+                    await asyncio.sleep(0.3)
             else:
-                # Few unread messages - they should be visible, just scroll down to load more if needed
-                print(f"  📬 Few unread messages visible")
-                # Scroll down slightly to ensure all visible unread messages are loaded
-                await message_container.evaluate('element => element.scrollTop += 300')
+                # Few unread messages - they should be visible at bottom
+                print(f"  📬 Few unread messages - checking bottom of view")
+                
+                # Scroll to bottom to see unread messages
+                await message_container.evaluate('el => el.scrollTop = el.scrollHeight')
+                await asyncio.sleep(0.5)
+                
+                # Scroll up a bit to load messages above
+                await message_container.evaluate('el => el.scrollTop -= 300')
                 await asyncio.sleep(0.3)
             
         except Exception as e:
             print(f"  Error scrolling to unread: {e}")
+            import traceback
+            traceback.print_exc()
     
     async def scroll_to_load_messages(self, max_scrolls: int = 10):
         """Scroll to load messages - minimal scrolling for unread mode."""
@@ -1267,11 +1321,15 @@ class DiscordScraper:
         messages = []
         
         try:
-            # Wait a bit for messages to load and for Discord to auto-scroll (if many unread)
-            await asyncio.sleep(1.5)
+            # Wait longer for Discord to auto-scroll to unread messages (if many unread)
+            # Discord needs time to position the view at unread messages
+            await asyncio.sleep(2.5)
             
             # Scroll to load messages (handles unread messages appropriately)
             await self.scroll_to_load_messages()
+            
+            # Wait a bit more for messages to render after scrolling
+            await asyncio.sleep(1)
             
             # Try multiple selectors for message elements
             message_selectors = [
@@ -1295,12 +1353,43 @@ class DiscordScraper:
                 all_divs = await self.page.query_selector_all('div')
                 message_elements = [d for d in all_divs if 'message' in (await d.get_attribute('class') or '').lower()]
             
-            # Extract all visible messages
-            # If unread mode: Discord already positioned us at unread messages
-            # - Few unread: visible immediately
-            # - Many unread: Discord auto-scrolled to first unread
+            # Extract messages - focus on unread messages if in unread mode
+            unread_marker_y = None
+            if self.scrape_unread_only:
+                unread_marker_y = await self.find_unread_marker_position()
+                if unread_marker_y:
+                    print(f"  📍 Unread marker found - extracting messages below marker")
+                else:
+                    print(f"  📍 No unread marker found - extracting visible messages (likely few unread)")
+            
+            # Get viewport bounds to filter messages
+            viewport_height = await self.page.evaluate('window.innerHeight')
+            
             for element in message_elements:
                 try:
+                    element_box = await element.bounding_box()
+                    if not element_box:
+                        continue
+                    
+                    element_y = element_box['y']
+                    
+                    # If we have an unread marker, only extract messages at or below it
+                    if self.scrape_unread_only and unread_marker_y:
+                        # Unread messages are below the marker
+                        # Only extract messages that are at or below the unread marker
+                        if element_y < unread_marker_y - 100:  # 100px tolerance above marker
+                            continue  # Skip messages too far above the marker (already read)
+                    elif self.scrape_unread_only:
+                        # No marker found - likely few unread messages visible
+                        # Extract messages in the lower portion of viewport (where unread usually are)
+                        viewport_bottom = viewport_height
+                        if element_y > viewport_bottom - 600:  # Lower 600px of viewport
+                            # This is likely an unread message
+                            pass
+                        else:
+                            # Skip messages in upper portion (likely already read)
+                            continue
+                    
                     message_data = await self.extract_message_data(element)
                     if message_data:
                         messages.append(message_data)
@@ -1480,26 +1569,46 @@ class DiscordScraper:
                 print(f"  {'-'*60}\n")
             
             # Filter messages by target username - improved matching
+            # Include messages FROM target user OR messages that MENTION target user in content
             filtered_messages = []
             target_username_normalized = self.normalize_username(self.target_username)
             
             for msg in messages:
                 msg_username = msg.get('username', '')
+                msg_content = msg.get('content', '')
                 msg_username_normalized = self.normalize_username(msg_username)
+                msg_content_normalized = msg_content.lower() if msg_content else ''
                 
-                # Try multiple matching strategies
-                matches = (
+                # Check if message is FROM target user
+                matches_username = (
                     target_username_normalized in msg_username_normalized or
                     msg_username_normalized in target_username_normalized or
                     self.target_username in msg_username or
                     msg_username in self.target_username
                 )
                 
-                if matches:
+                # Check if message content MENTIONS target user
+                matches_content = (
+                    self.target_username.lower() in msg_content_normalized or
+                    target_username_normalized in msg_content_normalized or
+                    self.target_username in msg_content
+                )
+                
+                if matches_username or matches_content:
                     filtered_messages.append(msg)
             
             if filtered_messages:
+                # Count messages from user vs messages mentioning user
+                from_user = sum(1 for msg in filtered_messages 
+                              if self.normalize_username(self.target_username) in self.normalize_username(msg.get('username', '')))
+                mentioning_user = len(filtered_messages) - from_user
+                
                 print(f"  ✓ Found {len(filtered_messages)} messages matching '{self.target_username}'")
+                if from_user > 0:
+                    print(f"    - {from_user} message(s) FROM '{self.target_username}'")
+                if mentioning_user > 0:
+                    print(f"    - {mentioning_user} message(s) MENTIONING '{self.target_username}'")
+                
                 for msg in filtered_messages:
                     msg['channel'] = channel_name
                     self.messages.append(msg)
@@ -1553,32 +1662,52 @@ class DiscordScraper:
                     print(f"    - {uname}")
             
             # Use improved matching
+            # Include messages FROM target user OR messages that MENTION target user in content
             target_username_normalized = self.normalize_username(self.target_username)
             filtered = []
             for msg in messages:
                 msg_username = msg.get('username', '')
+                msg_content = msg.get('content', '')
                 msg_username_normalized = self.normalize_username(msg_username)
+                msg_content_normalized = msg_content.lower() if msg_content else ''
                 
-                matches = (
+                # Check if message is FROM target user
+                matches_username = (
                     target_username_normalized in msg_username_normalized or
                     msg_username_normalized in target_username_normalized or
                     self.target_username in msg_username or
                     msg_username in self.target_username
                 )
                 
-                if matches:
+                # Check if message content MENTIONS target user
+                matches_content = (
+                    self.target_username.lower() in msg_content_normalized or
+                    target_username_normalized in msg_content_normalized or
+                    self.target_username in msg_content
+                )
+                
+                if matches_username or matches_content:
                     filtered.append(msg)
             
             self.messages.extend(filtered)
         else:
             print(f"Found {len(channels)} subnet channels. Starting to scrape...\n")
             
-            # for i, channel in enumerate(channels, 1):
-            #     print(f"[{i}/{len(channels)}] Processing subnet: {channel['name']}")
-            #     await self.scrape_channel(channel['name'], channel.get('href'))
-            #     await asyncio.sleep(1.5)  # Small delay between channels to avoid rate limiting
+            for i, channel in enumerate(channels, 1):
+                print(f"[{i}/{len(channels)}] Processing subnet: {channel['name']}")
+                await self.scrape_channel(channel['name'], channel.get('href'))
+                await asyncio.sleep(1.5)  # Small delay between channels to avoid rate limiting
         
-        print(f"\n✓ Scraping complete! Found {len(self.messages)} messages from {self.target_username} across {len(channels)} subnets")
+        # Count messages from user vs messages mentioning user
+        from_user = sum(1 for msg in self.messages 
+                      if self.normalize_username(self.target_username) in self.normalize_username(msg.get('username', '')))
+        mentioning_user = len(self.messages) - from_user
+        
+        print(f"\n✓ Scraping complete! Found {len(self.messages)} messages matching '{self.target_username}' across {len(channels)} subnets")
+        if from_user > 0:
+            print(f"  - {from_user} message(s) FROM '{self.target_username}'")
+        if mentioning_user > 0:
+            print(f"  - {mentioning_user} message(s) MENTIONING '{self.target_username}'")
     
     async def save_results(self, filename: str = None):
         """Save scraped messages to a JSON file."""
@@ -1626,7 +1755,7 @@ async def main():
     print("Discord Message Scraper - Bittensor Subnets")
     print("="*60)
     print(f"\nTarget: Bittensor server")
-    print(f"Filtering messages from user: D&C")
+    print(f"Filtering messages from user: consτ [τ, τ]")
     print(f"Scraping: All subnet channels (1-128)")
     print(f"Time limit: Last 30 minutes only\n")
     
@@ -1642,7 +1771,7 @@ async def main():
     print("Starting scraper...\n")
     
     # Create and run scraper with hardcoded values
-    scraper = DiscordScraper(target_username="D&C", target_server="bittensor", headless=headless, scrape_unread_only=True)
+    scraper = DiscordScraper(target_username="consτ [τ, τ]", target_server="bittensor", headless=headless, scrape_unread_only=True)
     await scraper.run()
 
 
