@@ -899,13 +899,13 @@ class DiscordScraper:
                         print(f"  - Skipping category header: {name}")
                         continue
                     
-                    # Skip channels with "ex" in the name (expired/past subnets)
+                    # Skip channels with "ex" right after "・" (expired/past subnets)
                     # Examples: "xxxx・ex123" - these are past subnets, not active ones
-                    if 'ex' in name_lower:
-                        # Check if "ex" appears before a number (like "ex123" or "・ex123")
-                        if re.search(r'ex\s*\d+', name_lower) or re.search(r'・ex\d+', name_lower):
-                            print(f"  - Skipping expired subnet: {name} (contains 'ex')")
-                            continue
+                    # Note: "𝛼・apex・1" should NOT be skipped because "ex" is part of "apex", not right after "・"
+                    # Pattern matches: "・ex" followed by a number (ex must come right after the separator)
+                    if re.search(r'・ex\d+', name_lower):
+                        print(f"  - Skipping expired subnet: {name} (contains '・ex' pattern)")
+                        continue
                     
                     # Get channel link/ID - must have href to be a clickable channel
                     href = await element.get_attribute('href')
