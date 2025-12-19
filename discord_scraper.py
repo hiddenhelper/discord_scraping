@@ -15,7 +15,7 @@ from playwright.async_api import async_playwright, Page, Browser
 
 
 class DiscordScraper:
-    def __init__(self, target_username: str = "D&C", target_server: str = "bittensor", headless: bool = False, time_limit_minutes: int = 30):
+    def __init__(self, target_username: str = "Mams [τ, ꨄ]", target_server: str = "bittensor", headless: bool = False, scrape_unread_only: bool = True):
         """
         Initialize the Discord scraper.
         
@@ -23,19 +23,20 @@ class DiscordScraper:
             target_username: The username to filter messages for (default: "D&C")
             target_server: The server name to scrape (default: "bittensor")
             headless: Whether to run browser in headless mode
-            time_limit_minutes: Only scrape messages from the last N minutes (default: 30)
+            scrape_unread_only: Only scrape unread messages (default: True) - faster and avoids duplicates
         """
         self.target_username = target_username
         self.target_server = target_server.lower()
         self.headless = headless
-        self.time_limit_minutes = time_limit_minutes
-        self.cutoff_time = datetime.now() - timedelta(minutes=time_limit_minutes)
+        self.scrape_unread_only = scrape_unread_only
         self.messages: List[Dict] = []
         self.browser: Optional[Browser] = None
         self.page: Optional[Page] = None
         
-        print(f"⏰ Time filter: Only scraping messages from the last {time_limit_minutes} minutes")
-        print(f"   Cutoff time: {self.cutoff_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        if scrape_unread_only:
+            print(f"📬 Mode: Only scraping UNREAD messages (faster, avoids duplicates)")
+        else:
+            print(f"📬 Mode: Scraping all messages")
         
     async def setup_browser(self):
         """Initialize browser and navigate to Discord."""
@@ -411,6 +412,330 @@ class DiscordScraper:
         
         raise TimeoutError("Login timeout. Please ensure you've logged in to Discord.")
     
+    async def expand_all_categories(self, scroll_container=None):
+        """Expand all collapsed channel categories to show all channels."""
+        try:
+            # Find category headers/buttons that can be clicked to expand
+            category_selectors = [
+                'button[class*="category"]',
+                'div[class*="category"][role="button"]',
+                'div[class*="categoryHeader"]',
+                '[aria-label*="category"]',
+                'button[aria-expanded="false"]',  # Collapsed categories
+                'div[class*="containerDefault"][class*="clickable"]'  # Category containers
+            ]
+            
+            expanded_count = 0
+            last_expanded = -1
+            
+            # Try multiple passes to expand all categories
+            for pass_num in range(5):  # Multiple passes to catch all categories
+                current_expanded = 0
+                
+                for selector in category_selectors:
+                    try:
+                        category_buttons = await self.page.query_selector_all(selector)
+                        for btn in category_buttons:
+                            try:
+                                # Check if it's collapsed
+                                aria_expanded = await btn.get_attribute('aria-expanded')
+                                if aria_expanded == 'false':
+                                    # Scroll element into view if needed
+                                    if scroll_container:
+                                        try:
+                                            await btn.scroll_into_view_if_needed()
+                                            await asyncio.sleep(0.1)
+                                        except:
+                                            pass
+                                    
+                                    await btn.click()
+                                    await asyncio.sleep(0.2)
+                                    current_expanded += 1
+                                    expanded_count += 1
+                            except:
+                                # Try clicking anyway (might be expandable)
+                                try:
+                                    if scroll_container:
+                                        try:
+                                            await btn.scroll_into_view_if_needed()
+                                            await asyncio.sleep(0.1)
+                                        except:
+                                            pass
+                                    await btn.click()
+                                    await asyncio.sleep(0.2)
+                                    current_expanded += 1
+                                    expanded_count += 1
+                                except:
+                                    pass
+                    except:
+                        continue
+                
+                # If no new categories expanded, we're done
+                if current_expanded == 0 and last_expanded == 0:
+                    break
+                
+                last_expanded = current_expanded
+                await asyncio.sleep(0.3)
+            
+            if expanded_count > 0:
+                print(f"  Expanded {expanded_count} categories")
+            else:
+                print(f"  No collapsed categories found (or already expanded)")
+                
+        except Exception as e:
+            print(f"  ⚠ Error expanding categories: {e}")
+    
+    async def scroll_channel_list(self, max_scrolls: int = 200):
+        """Scroll the channel list in the left panel to load all channels."""
+        try:
+            print("Scrolling channel list to load all channels...")
+            
+            # First, expand all categories
+            await self.expand_all_categories()
+            await asyncio.sleep(1)
+            
+            # Find the channel list container (left sidebar)
+            channel_list_selectors = [
+                'nav[aria-label*="Channels"]',
+                'nav[aria-label*="channels"]',
+                'div[class*="channels"]',
+                'div[class*="sidebar"]',
+                '[class*="scroller"][class*="channel"]',
+                'div[class*="list"]'
+            ]
+            
+            channel_list_container = None
+            for selector in channel_list_selectors:
+                try:
+                    container = await self.page.query_selector(selector)
+                    if container:
+                        # Check if it's scrollable
+                        is_scrollable = await container.evaluate('el => el.scrollHeight > el.clientHeight')
+                        if is_scrollable:
+                            channel_list_container = container
+                            print(f"  Found scrollable channel list container")
+                            break
+                except:
+                    continue
+            
+            # If no specific container found, try to find any scrollable element in the sidebar
+            if not channel_list_container:
+                # Look for scrollable divs in the sidebar area
+                all_divs = await self.page.query_selector_all('div[class*="scroller"], div[class*="scrollable"]')
+                for div in all_divs:
+                    try:
+                        is_scrollable = await div.evaluate('el => el.scrollHeight > el.clientHeight')
+                        if is_scrollable:
+                            # Check if it's in the sidebar (left side of page)
+                            bounding_box = await div.bounding_box()
+                            if bounding_box and bounding_box['x'] < 300:  # Sidebar is on the left
+                                channel_list_container = div
+                                print(f"  Found scrollable sidebar container")
+                                break
+                    except:
+                        continue
+            
+            if channel_list_container:
+                last_height = 0
+                scroll_count = 0
+                no_change_count = 0
+                
+                # Start from top
+                await channel_list_container.evaluate('el => el.scrollTop = 0')
+                await asyncio.sleep(0.5)
+                
+                for i in range(max_scrolls):
+                    # Get current measurements
+                    current_height = await channel_list_container.evaluate('el => el.scrollHeight')
+                    scroll_top = await channel_list_container.evaluate('el => el.scrollTop')
+                    client_height = await channel_list_container.evaluate('el => el.clientHeight')
+                    
+                    # Scroll down incrementally (not all the way at once)
+                    scroll_amount = client_height * 0.8  # Scroll 80% of viewport
+                    new_scroll = scroll_top + scroll_amount
+                    await channel_list_container.evaluate(f'el => el.scrollTop = {new_scroll}')
+                    await asyncio.sleep(0.4)  # Wait for channels to load
+                    
+                    # Check if we've reached the bottom
+                    new_scroll_top = await channel_list_container.evaluate('el => el.scrollTop')
+                    new_height = await channel_list_container.evaluate('el => el.scrollHeight')
+                    
+                    # Check if we're at the bottom
+                    if new_scroll_top + client_height >= new_height - 10:  # 10px tolerance
+                        print(f"  Reached bottom of channel list after {i+1} scrolls")
+                        break
+                    
+                    # Check if new channels loaded
+                    if new_height == last_height:
+                        no_change_count += 1
+                        if no_change_count > 3:
+                            # No new content for a while, might be at bottom
+                            print(f"  No new channels loading after {i+1} scrolls")
+                            break
+                    else:
+                        no_change_count = 0
+                    
+                    last_height = new_height
+                    scroll_count = i + 1
+                    
+                    # Progress update every 20 scrolls
+                    if (i + 1) % 20 == 0:
+                        print(f"  Scrolled {i+1} times, found {new_height}px of content")
+                
+                print(f"  Scrolled channel list {scroll_count} times, total height: {last_height}px")
+                
+                # Scroll back to top
+                await channel_list_container.evaluate('el => el.scrollTop = 0')
+                await asyncio.sleep(1)  # Wait for DOM to settle
+            else:
+                print("  ⚠ Could not find scrollable channel list container, proceeding with visible channels only")
+                
+        except Exception as e:
+            print(f"  ⚠ Error scrolling channel list: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    async def collect_channels_while_scrolling(self) -> List[Dict]:
+        """Collect all channel elements while scrolling through the channel list."""
+        all_channel_elements = []
+        seen_hrefs = set()
+        
+        try:
+            # Find the channel list container
+            channel_list_container = None
+            selectors = [
+                'nav[aria-label*="Channels"]',
+                'nav[aria-label*="channels"]',
+                'div[class*="channels"]',
+                'div[class*="sidebar"]',
+                '[class*="scroller"][class*="channel"]'
+            ]
+            
+            for selector in selectors:
+                try:
+                    container = await self.page.query_selector(selector)
+                    if container:
+                        is_scrollable = await container.evaluate('el => el.scrollHeight > el.clientHeight')
+                        if is_scrollable:
+                            channel_list_container = container
+                            break
+                except:
+                    continue
+            
+            if not channel_list_container:
+                all_divs = await self.page.query_selector_all('div[class*="scroller"], div[class*="scrollable"]')
+                for div in all_divs:
+                    try:
+                        is_scrollable = await div.evaluate('el => el.scrollHeight > el.clientHeight')
+                        if is_scrollable:
+                            bounding_box = await div.bounding_box()
+                            if bounding_box and bounding_box['x'] < 300:
+                                channel_list_container = div
+                                break
+                    except:
+                        continue
+            
+            if channel_list_container:
+                # Start from top
+                await channel_list_container.evaluate('el => el.scrollTop = 0')
+                await asyncio.sleep(0.5)
+                
+                # Expand categories at the start
+                await self.expand_all_categories(scroll_container=channel_list_container)
+                await asyncio.sleep(0.5)
+                
+                last_height = 0
+                scroll_count = 0
+                max_scrolls = 300  # Increased for more thorough scrolling
+                no_change_count = 0
+                last_channel_count = 0
+                
+                for i in range(max_scrolls):
+                    # Expand categories periodically as we scroll (new categories might appear)
+                    if i > 0 and i % 30 == 0:
+                        await self.expand_all_categories(scroll_container=channel_list_container)
+                        await asyncio.sleep(0.3)
+                    
+                    # Collect channels at current scroll position
+                    channel_links = await self.page.query_selector_all('a[href^="/channels/"]')
+                    
+                    for link in channel_links:
+                        try:
+                            href = await link.get_attribute('href')
+                            if href and href not in seen_hrefs:
+                                seen_hrefs.add(href)
+                                all_channel_elements.append(link)
+                        except:
+                            continue
+                    
+                    # Scroll down
+                    current_height = await channel_list_container.evaluate('el => el.scrollHeight')
+                    scroll_top = await channel_list_container.evaluate('el => el.scrollTop')
+                    client_height = await channel_list_container.evaluate('el => el.clientHeight')
+                    
+                    # Check if we're at the absolute bottom
+                    if scroll_top + client_height >= current_height - 5:  # 5px tolerance
+                        # Try scrolling to absolute bottom one more time
+                        await channel_list_container.evaluate('el => el.scrollTop = el.scrollHeight')
+                        await asyncio.sleep(0.5)
+                        
+                        # Expand categories one final time at bottom
+                        await self.expand_all_categories(scroll_container=channel_list_container)
+                        await asyncio.sleep(0.5)
+                        
+                        # Final collection at bottom
+                        final_links = await self.page.query_selector_all('a[href^="/channels/"]')
+                        for link in final_links:
+                            try:
+                                href = await link.get_attribute('href')
+                                if href and href not in seen_hrefs:
+                                    seen_hrefs.add(href)
+                                    all_channel_elements.append(link)
+                            except:
+                                continue
+                        
+                        print(f"  Reached absolute bottom after {i+1} scrolls")
+                        break
+                    
+                    scroll_amount = client_height * 0.75  # Slightly smaller increments
+                    new_scroll = scroll_top + scroll_amount
+                    await channel_list_container.evaluate(f'el => el.scrollTop = {new_scroll}')
+                    await asyncio.sleep(0.4)
+                    
+                    new_height = await channel_list_container.evaluate('el => el.scrollHeight')
+                    
+                    # Check if new channels were found
+                    if len(all_channel_elements) == last_channel_count:
+                        no_change_count += 1
+                    else:
+                        no_change_count = 0
+                    
+                    # If no new channels for several scrolls and height hasn't changed, might be at bottom
+                    if new_height == last_height and no_change_count > 3 and i > 10:
+                        # Try scrolling to bottom one more time
+                        await channel_list_container.evaluate('el => el.scrollTop = el.scrollHeight')
+                        await asyncio.sleep(0.5)
+                        break
+                    
+                    last_height = new_height
+                    last_channel_count = len(all_channel_elements)
+                    scroll_count = i + 1
+                    
+                    if (i + 1) % 20 == 0:
+                        print(f"  Collected {len(all_channel_elements)} channels so far (scroll {i+1}, height: {new_height}px)")
+                
+                print(f"  Total collected: {len(all_channel_elements)} channels after {scroll_count} scrolls")
+                
+                # Scroll back to top
+                await channel_list_container.evaluate('el => el.scrollTop = 0')
+                await asyncio.sleep(0.5)
+            
+            return all_channel_elements
+            
+        except Exception as e:
+            print(f"  Error collecting channels while scrolling: {e}")
+            return all_channel_elements
+    
     async def get_subnet_channels(self) -> List[Dict]:
         """
         Extract subnet channels from the Bittensor server.
@@ -425,50 +750,162 @@ class DiscordScraper:
             await self.page.wait_for_selector('[class*="channel"], [class*="channelText"], [data-list-item-id*="channel"]', timeout=10000)
             await asyncio.sleep(2)  # Give extra time for channels to render
             
-            # Try multiple selectors for channel elements
-            channel_selectors = [
-                'a[href^="/channels/"]',  # Actual clickable channels
-                '[class*="channel"]',
-                '[class*="channelText"]',
-                '[data-list-item-id*="channel"]',
-                'div[class*="container"] a[href*="/channels/"]'
-            ]
+            print("\nCollecting all channels while scrolling...")
+            # Collect channels incrementally while scrolling (this also expands categories)
+            channel_elements = await self.collect_channels_while_scrolling()
             
-            channel_elements = []
-            for selector in channel_selectors:
-                elements = await self.page.query_selector_all(selector)
-                if elements:
-                    channel_elements = elements
-                    print(f"Found {len(elements)} potential channel elements using: {selector}")
-                    break
+            # One more pass: scroll to bottom and expand categories there
+            print("\nFinal pass: Ensuring we reach 'subnets 3' category...")
+            try:
+                # Find scroll container again
+                channel_list_container = None
+                selectors = ['nav[aria-label*="Channels"]', 'div[class*="channels"]', 'div[class*="scroller"]']
+                for selector in selectors:
+                    try:
+                        container = await self.page.query_selector(selector)
+                        if container:
+                            is_scrollable = await container.evaluate('el => el.scrollHeight > el.clientHeight')
+                            if is_scrollable:
+                                channel_list_container = container
+                                break
+                    except:
+                        continue
+                
+                if not channel_list_container:
+                    all_divs = await self.page.query_selector_all('div[class*="scroller"], div[class*="scrollable"]')
+                    for div in all_divs:
+                        try:
+                            is_scrollable = await div.evaluate('el => el.scrollHeight > el.clientHeight')
+                            if is_scrollable:
+                                bounding_box = await div.bounding_box()
+                                if bounding_box and bounding_box['x'] < 300:
+                                    channel_list_container = div
+                                    break
+                        except:
+                            continue
+                
+                if channel_list_container:
+                    # Scroll all the way to bottom
+                    await channel_list_container.evaluate('el => el.scrollTop = el.scrollHeight')
+                    await asyncio.sleep(1)
+                    
+                    # Expand categories at bottom (including "subnets 3")
+                    await self.expand_all_categories(scroll_container=channel_list_container)
+                    await asyncio.sleep(1)
+                    
+                    # Collect any new channels from bottom
+                    bottom_links = await self.page.query_selector_all('a[href^="/channels/"]')
+                    existing_hrefs = set()
+                    for elem in channel_elements:
+                        try:
+                            href = await elem.get_attribute('href')
+                            if href:
+                                existing_hrefs.add(href)
+                        except:
+                            continue
+                    
+                    new_from_bottom = 0
+                    for link in bottom_links:
+                        try:
+                            href = await link.get_attribute('href')
+                            if href and href not in existing_hrefs:
+                                channel_elements.append(link)
+                                existing_hrefs.add(href)
+                                new_from_bottom += 1
+                        except:
+                            continue
+                    
+                    if new_from_bottom > 0:
+                        print(f"  Found {new_from_bottom} additional channels from bottom categories (subnets 3)")
+            except Exception as e:
+                print(f"  ⚠ Error in final bottom pass: {e}")
             
-            print(f"\nScanning channels to find subnets...")
+            await asyncio.sleep(1)
+            
+            # Final collection pass - get all channel links one more time
+            final_channel_links = await self.page.query_selector_all('a[href^="/channels/"]')
+            
+            # Build set of hrefs we already have
+            existing_hrefs = set()
+            for elem in channel_elements:
+                try:
+                    href = await elem.get_attribute('href')
+                    if href:
+                        existing_hrefs.add(href)
+                except:
+                    continue
+            
+            # Add any new channels found in final scan
+            new_channels_added = 0
+            for link in final_channel_links:
+                try:
+                    href = await link.get_attribute('href')
+                    if href and href not in existing_hrefs:
+                        existing_hrefs.add(href)
+                        channel_elements.append(link)
+                        new_channels_added += 1
+                except:
+                    continue
+            
+            if new_channels_added > 0:
+                print(f"  Added {new_channels_added} additional channels from final scan")
+            
+            print(f"\nTotal unique channels found: {len(channel_elements)}")
+            print(f"Scanning channels to find subnets...")
             print("Looking for channels with numbers (subnet numbers)...")
             
             for element in channel_elements:
                 try:
-                    # Get channel name
+                    # Get channel name - handle aria-hidden elements
                     name = None
-                    name_elem = await element.query_selector('[class*="name"], span[class*="name"], div[class*="name"], div[class*="content"]')
-                    if name_elem:
-                        name = await name_elem.inner_text()
-                        name = name.strip()
                     
-                    # If no name found, try getting text directly
+                    # Try multiple selectors for name element (including aria-hidden)
+                    name_selectors = [
+                        '[class*="name"]',  # Matches class like "*-name"
+                        'span[class*="name"]',
+                        'div[class*="name"]',
+                        'div[class*="content"]',
+                        '[aria-label]'  # Fallback to aria-label
+                    ]
+                    
+                    for name_selector in name_selectors:
+                        name_elem = await element.query_selector(name_selector)
+                        if name_elem:
+                            # Try inner_text first
+                            name = await name_elem.inner_text()
+                            if not name or not name.strip():
+                                # If inner_text fails (e.g., aria-hidden), try text_content
+                                name = await name_elem.evaluate('el => el.textContent || el.innerText')
+                            name = name.strip() if name else None
+                            if name:
+                                break
+                    
+                    # If no name found, try getting text directly from element
                     if not name:
                         name = await element.inner_text()
-                        name = name.strip()
+                        if not name or not name.strip():
+                            # Try text_content as fallback
+                            name = await element.evaluate('el => el.textContent || el.innerText')
+                        name = name.strip() if name else None
                     
                     # Skip if no name
                     if not name:
                         continue
                     
-                    # Skip category headers (like "subnets 1", "subnets 2", "subnets 3")
+                    # Skip category headers (like "subnets", "subnets 2", "subnets 3")
                     # These are not actual channels, just category labels
                     name_lower = name.lower()
                     if re.match(r'^subnets?\s+\d+$', name_lower.strip()):
                         print(f"  - Skipping category header: {name}")
                         continue
+                    
+                    # Skip channels with "ex" in the name (expired/past subnets)
+                    # Examples: "xxxx・ex123" - these are past subnets, not active ones
+                    if 'ex' in name_lower:
+                        # Check if "ex" appears before a number (like "ex123" or "・ex123")
+                        if re.search(r'ex\s*\d+', name_lower) or re.search(r'・ex\d+', name_lower):
+                            print(f"  - Skipping expired subnet: {name} (contains 'ex')")
+                            continue
                     
                     # Get channel link/ID - must have href to be a clickable channel
                     href = await element.get_attribute('href')
@@ -483,35 +920,29 @@ class DiscordScraper:
                         continue
                     
                     # Check if channel name contains a number (subnet number)
-                    # Examples: "neza 99", "hippius 75", etc.
+                    # Examples: "neza 99", "hippius 75", "θ・vanta・8", etc.
                     # Extract all numbers from the channel name
                     numbers = re.findall(r'\d+', name)
                     
                     if numbers:
-                        # Check if any number is in the valid subnet range (1-128)
+                        # STRICTLY check if any number is in the valid subnet range (1-128)
+                        # Only accept subnets 1-128, nothing outside this range
                         is_subnet_channel = False
                         subnet_number = None
                         
                         for num_str in numbers:
                             try:
                                 num = int(num_str)
+                                # Only accept if number is between 1 and 128 (inclusive)
                                 if 1 <= num <= 128:
                                     is_subnet_channel = True
                                     subnet_number = num
-                                    break
+                                    break  # Use first valid subnet number found
                             except:
                                 continue
                         
-                        # If no number in 1-128 range, but has a number, still consider it
-                        # (in case subnet numbers go beyond 128 or are formatted differently)
-                        if not is_subnet_channel and numbers:
-                            try:
-                                subnet_number = int(numbers[0])  # Use first number found
-                                is_subnet_channel = True
-                            except:
-                                pass
-                        
-                        if is_subnet_channel:
+                        # Only add if we found a valid subnet number (1-128)
+                        if is_subnet_channel and subnet_number:
                             channels.append({
                                 'name': name,
                                 'href': href,
@@ -519,6 +950,7 @@ class DiscordScraper:
                                 'subnet_number': subnet_number
                             })
                             print(f"  ✓ Found subnet channel: {name} (subnet {subnet_number})")
+                        # If channel has numbers but none in 1-128 range, skip it
                             
                 except Exception as e:
                     continue
@@ -531,21 +963,31 @@ class DiscordScraper:
                     seen_hrefs.add(ch['href'])
                     unique_channels.append(ch)
             
-            # Sort channels by subnet number if available, otherwise by name
-            def sort_key(ch):
-                if ch.get('subnet_number'):
-                    return (0, ch['subnet_number'])
-                return (1, ch['name'])
+            # Filter to only include channels with subnet numbers 1-128
+            filtered_channels = []
+            for ch in unique_channels:
+                subnet_num = ch.get('subnet_number')
+                if subnet_num and 1 <= subnet_num <= 128:
+                    filtered_channels.append(ch)
             
-            unique_channels.sort(key=sort_key)
+            # Sort channels by subnet number
+            filtered_channels.sort(key=lambda ch: ch.get('subnet_number', 999))
             
-            print(f"\n✓ Found {len(unique_channels)} subnet channels")
-            if unique_channels:
-                subnet_numbers = [ch.get('subnet_number') for ch in unique_channels if ch.get('subnet_number')]
+            print(f"\n✓ Found {len(filtered_channels)} subnet channels (subnets 1-128)")
+            if filtered_channels:
+                subnet_numbers = [ch.get('subnet_number') for ch in filtered_channels if ch.get('subnet_number')]
                 if subnet_numbers:
                     print(f"  Subnet numbers found: {min(subnet_numbers)} - {max(subnet_numbers)}")
+                    print(f"  Total unique subnets: {len(set(subnet_numbers))}")
+                    
+                    # Show which subnet numbers are missing (if any)
+                    found_set = set(subnet_numbers)
+                    expected_set = set(range(1, 129))
+                    missing = sorted(expected_set - found_set)
+                    if missing:
+                        print(f"  ⚠ Missing subnet numbers: {missing[:20]}{'...' if len(missing) > 20 else ''}")
             
-            return unique_channels
+            return filtered_channels
             
         except Exception as e:
             print(f"Error getting subnet channels: {e}")
@@ -616,20 +1058,136 @@ class DiscordScraper:
         except Exception as e:
             return None
     
-    async def scroll_to_load_messages(self, max_scrolls: int = 50, stop_when_old: bool = True):
-        """Scroll up in the message area to load older messages.
-        
-        Args:
-            max_scrolls: Maximum number of scrolls
-            stop_when_old: Stop scrolling when messages are older than cutoff_time
+    async def channel_has_unread(self, channel_elem) -> bool:
+        """Check if a channel has unread messages by checking if the name is bold."""
+        try:
+            if not channel_elem:
+                return False
+            
+            # The channel element should be the <a> tag with href
+            # Find the name div inside it: <div class="_2ea32c412048f708-name ...">
+            name_elem = await channel_elem.query_selector('div[class*="name"]')
+            
+            if not name_elem:
+                # Try alternative selectors
+                name_elem = await channel_elem.query_selector('[class*="name"]')
+            
+            if name_elem:
+                # Check computed style for font-weight (works even with aria-hidden)
+                try:
+                    font_weight = await name_elem.evaluate('el => window.getComputedStyle(el).fontWeight')
+                    
+                    if font_weight:
+                        # Check if bold - Discord uses 500+ for unread channels
+                        if font_weight == 'bold':
+                            return True
+                        try:
+                            fw_num = int(font_weight)
+                            # Discord uses 500 or higher for unread (bold) channels
+                            if fw_num >= 500:
+                                return True
+                        except:
+                            # If it's a string like "500", "600", "700", check directly
+                            if font_weight in ['500', '600', '700', '800', '900']:
+                                return True
+                except Exception as e:
+                    pass
+                
+                # Also check if the element itself has bold styling via CSS
+                try:
+                    # Check computed font-weight including inherited styles
+                    is_bold = await name_elem.evaluate('el => { const style = window.getComputedStyle(el); const fw = style.fontWeight; if (fw === "bold") return true; const fwNum = parseInt(fw); return fwNum >= 500; }')
+                    if is_bold:
+                        return True
+                except:
+                    pass
+            
+            # Check the <a> element itself for bold styling
+            try:
+                link_font_weight = await channel_elem.evaluate('el => window.getComputedStyle(el).fontWeight')
+                if link_font_weight:
+                    if link_font_weight == 'bold':
+                        return True
+                    try:
+                        if int(link_font_weight) >= 500:
+                            return True
+                    except:
+                        if link_font_weight in ['500', '600', '700', '800', '900']:
+                            return True
+            except:
+                pass
+            
+            # Check for unread class on the channel element or its parents
+            channel_class = await channel_elem.get_attribute('class') or ""
+            if 'unread' in channel_class.lower():
+                return True
+            
+            # Check parent wrapper for unread indicators
+            try:
+                parent = await channel_elem.evaluate_handle('el => el.parentElement')
+                if parent:
+                    parent_class = await parent.evaluate('el => el.className || ""')
+                    if 'unread' in parent_class.lower():
+                        return True
+                    
+                    # Check if parent has bold styling
+                    parent_font_weight = await parent.evaluate('el => window.getComputedStyle(el).fontWeight')
+                    if parent_font_weight:
+                        if parent_font_weight == 'bold':
+                            return True
+                        try:
+                            if int(parent_font_weight) >= 500:
+                                return True
+                        except:
+                            if parent_font_weight in ['500', '600', '700', '800', '900']:
+                                return True
+            except:
+                pass
+            
+            # Check for unread badge
+            unread_badge = await channel_elem.query_selector('[class*="unread"], [class*="unreadBadge"], [class*="unreadCount"]')
+            if unread_badge:
+                return True
+            
+            return False
+        except Exception as e:
+            return False
+    
+    async def has_unread_messages_in_view(self) -> bool:
+        """Check if the current channel view shows unread messages."""
+        try:
+            # Look for unread markers in the message view
+            unread_selectors = [
+                'div[class*="newMessagesBar"]',
+                'div[class*="unreadBar"]',
+                'div[class*="newMessages"]',
+                '[class*="unread"]',
+                '[aria-label*="New messages"]',
+                '[aria-label*="new messages"]'
+            ]
+            
+            for selector in unread_selectors:
+                elements = await self.page.query_selector_all(selector)
+                if elements:
+                    return True
+            
+            return False
+        except:
+            return False
+    
+    async def scroll_to_load_unread_messages(self, max_scrolls: int = 10):
+        """
+        Handle scrolling for unread messages.
+        Discord behavior:
+        - If few unread: messages are visible immediately
+        - If many unread: Discord auto-scrolls to first unread message
         """
         try:
             # Find the message container
             message_container_selectors = [
                 '[class*="messages"]',
                 '[class*="scroller"]',
-                '[class*="messageContainer"]',
-                'div[class*="content"]'
+                '[class*="messageContainer"]'
             ]
             
             message_container = None
@@ -642,57 +1200,78 @@ class DiscordScraper:
                     continue
             
             if not message_container:
-                # Try to find by scrolling area
+                scrollable = await self.page.query_selector('[class*="scrollable"], [class*="scrollerInner"]')
+                if scrollable:
+                    message_container = scrollable
+            
+            if not message_container:
+                return
+            
+            # Wait a moment for Discord to auto-scroll to unread messages (if many unread)
+            await asyncio.sleep(1)
+            
+            # Check if we're already at unread messages (Discord auto-scrolled)
+            has_unread_marker = await self.has_unread_messages_in_view()
+            
+            if has_unread_marker:
+                print(f"  📬 Discord auto-scrolled to unread messages (many unread)")
+                # We're already at unread messages, just scroll down a bit to load more
+                await message_container.evaluate('element => element.scrollTop += 500')
+                await asyncio.sleep(0.3)
+            else:
+                # Few unread messages - they should be visible, just scroll down to load more if needed
+                print(f"  📬 Few unread messages visible")
+                # Scroll down slightly to ensure all visible unread messages are loaded
+                await message_container.evaluate('element => element.scrollTop += 300')
+                await asyncio.sleep(0.3)
+            
+        except Exception as e:
+            print(f"  Error scrolling to unread: {e}")
+    
+    async def scroll_to_load_messages(self, max_scrolls: int = 10):
+        """Scroll to load messages - minimal scrolling for unread mode."""
+        try:
+            message_container_selectors = [
+                '[class*="messages"]',
+                '[class*="scroller"]',
+                '[class*="messageContainer"]'
+            ]
+            
+            message_container = None
+            for selector in message_container_selectors:
+                try:
+                    message_container = await self.page.query_selector(selector)
+                    if message_container:
+                        break
+                except:
+                    continue
+            
+            if not message_container:
                 scrollable = await self.page.query_selector('[class*="scrollable"], [class*="scrollerInner"]')
                 if scrollable:
                     message_container = scrollable
             
             if message_container:
-                old_messages_found = False
-                for i in range(max_scrolls):
-                    # Check if we've scrolled past the time limit
-                    if stop_when_old and i > 5:  # Check after a few scrolls
-                        # Get a few messages to check their timestamps
-                        try:
-                            message_elements = await self.page.query_selector_all('[class*="message"]')
-                            if message_elements:
-                                # Check the oldest visible messages (first few)
-                                for msg_elem in message_elements[:5]:
-                                    timestamp_elem = await msg_elem.query_selector('[class*="timestamp"], time')
-                                    if timestamp_elem:
-                                        timestamp_str = await timestamp_elem.inner_text() or await timestamp_elem.get_attribute('datetime') or ""
-                                        if timestamp_str:
-                                            msg_time = self.parse_discord_timestamp(timestamp_str)
-                                            if msg_time and msg_time < self.cutoff_time:
-                                                old_messages_found = True
-                                                break
-                        except:
-                            pass
-                        
-                        if old_messages_found:
-                            print(f"  ⏰ Reached messages older than {self.time_limit_minutes} minutes, stopping scroll")
-                            break
-                    
-                    # Scroll up
+                if self.scrape_unread_only:
+                    # Handle unread messages (Discord auto-scrolls if many unread)
+                    await self.scroll_to_load_unread_messages()
+                else:
+                    # Scroll to top for all messages
                     await message_container.evaluate('element => element.scrollTop = 0')
-                    await asyncio.sleep(0.3)  # Reduced wait time for faster scraping
-                    
-                    # Also try keyboard shortcut
-                    await self.page.keyboard.press('Home')
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.3)
         except Exception as e:
             print(f"Error scrolling: {e}")
     
     async def extract_messages_from_channel(self) -> List[Dict]:
-        """Extract messages from the current channel (within time limit)."""
+        """Extract messages from the current channel (unread messages if enabled)."""
         messages = []
         
         try:
-            # Wait a bit for messages to load
-            await asyncio.sleep(1.5)  # Reduced wait time
+            # Wait a bit for messages to load and for Discord to auto-scroll (if many unread)
+            await asyncio.sleep(1.5)
             
-            # Scroll to load messages (will stop when reaching old messages)
-            await self.scroll_to_load_messages(max_scrolls=50, stop_when_old=True)
+            # Scroll to load messages (handles unread messages appropriately)
+            await self.scroll_to_load_messages()
             
             # Try multiple selectors for message elements
             message_selectors = [
@@ -716,27 +1295,15 @@ class DiscordScraper:
                 all_divs = await self.page.query_selector_all('div')
                 message_elements = [d for d in all_divs if 'message' in (await d.get_attribute('class') or '').lower()]
             
+            # Extract all visible messages
+            # If unread mode: Discord already positioned us at unread messages
+            # - Few unread: visible immediately
+            # - Many unread: Discord auto-scrolled to first unread
             for element in message_elements:
                 try:
                     message_data = await self.extract_message_data(element)
                     if message_data:
-                        # Check if message is within time limit
-                        msg_timestamp_str = message_data.get('timestamp', '')
-                        if msg_timestamp_str:
-                            msg_time = self.parse_discord_timestamp(msg_timestamp_str)
-                            if msg_time:
-                                if msg_time >= self.cutoff_time:
-                                    messages.append(message_data)
-                                # If message is older than cutoff, we can stop (messages are in chronological order)
-                                elif msg_time < self.cutoff_time:
-                                    # Don't add, but continue checking in case messages aren't perfectly sorted
-                                    pass
-                            else:
-                                # If we can't parse timestamp, include it (better to have it than miss it)
-                                messages.append(message_data)
-                        else:
-                            # No timestamp, include it
-                            messages.append(message_data)
+                        messages.append(message_data)
                 except Exception as e:
                     continue
             
@@ -749,21 +1316,7 @@ class DiscordScraper:
                     seen.add(key)
                     unique_messages.append(msg)
             
-            # Filter by time limit one more time to be sure
-            filtered_messages = []
-            for msg in unique_messages:
-                msg_timestamp_str = msg.get('timestamp', '')
-                if msg_timestamp_str:
-                    msg_time = self.parse_discord_timestamp(msg_timestamp_str)
-                    if msg_time and msg_time >= self.cutoff_time:
-                        filtered_messages.append(msg)
-                    elif not msg_time:
-                        # Include if we can't parse (better safe than sorry)
-                        filtered_messages.append(msg)
-                else:
-                    filtered_messages.append(msg)
-            
-            return filtered_messages
+            return unique_messages
             
         except Exception as e:
             print(f"Error extracting messages: {e}")
@@ -850,10 +1403,37 @@ class DiscordScraper:
     async def scrape_channel(self, channel_name: str, channel_href: str = None):
         """Scrape messages from a specific channel."""
         print(f"\n{'='*60}")
-        print(f"Scraping channel: {channel_name}")
+        print(f"Checking channel: {channel_name}")
         print(f"{'='*60}")
         
         try:
+            # If scraping unread only, check for unread indicator (bold text) before opening channel
+            if self.scrape_unread_only:
+                # Look for unread indicator on the channel in the sidebar
+                try:
+                    # Find the channel element
+                    channel_elem = None
+                    if channel_href:
+                        channel_elem = await self.page.query_selector(f'a[href*="{channel_href}"]')
+                    
+                    if channel_elem:
+                        # Check if channel name is bold (unread indicator)
+                        has_unread = await self.channel_has_unread(channel_elem)
+                        if not has_unread:
+                            print(f"  ⏭️  Channel name not bold (no unread), skipping")
+                            return
+                        else:
+                            print(f"  ✓ Channel has unread messages (bold name)")
+                    else:
+                        # If we can't find the element, proceed anyway
+                        print(f"  ⚠ Could not find channel element, proceeding...")
+                except Exception as e:
+                    # If we can't check, proceed anyway
+                    print(f"  ⚠ Error checking unread status: {e}, proceeding...")
+                    pass
+            
+            print(f"Scraping channel: {channel_name}")
+            
             # Click on the channel if href is provided
             if channel_href:
                 try:
@@ -861,36 +1441,43 @@ class DiscordScraper:
                     channel_link = await self.page.query_selector(f'a[href*="{channel_href}"]')
                     if channel_link:
                         await channel_link.click()
-                        await asyncio.sleep(2)  # Wait for channel to load
+                        await asyncio.sleep(1.5)  # Reduced wait time
+                    else:
+                        # Alternative: try to find and click by text
+                        await self.page.click(f'text={channel_name}')
+                        await asyncio.sleep(1.5)
                 except:
                     # Alternative: try to find and click by text
                     try:
                         await self.page.click(f'text={channel_name}')
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(1.5)
                     except:
                         pass
             
             # Extract messages (already filtered by time limit)
             messages = await self.extract_messages_from_channel()
             
-            print(f"\n  Found {len(messages)} messages from the last {self.time_limit_minutes} minutes")
+            if self.scrape_unread_only:
+                print(f"\n  Found {len(messages)} unread messages")
+            else:
+                print(f"\n  Found {len(messages)} messages")
             
             # Print ALL messages for debugging
-            # if messages:
-            #     print(f"\n  ALL MESSAGES FOUND IN '{channel_name}':")
-            #     print(f"  {'-'*60}")
-            #     unique_usernames = set()
-            #     for i, msg in enumerate(messages, 1):
-            #         username = msg.get('username', 'Unknown')
-            #         content_preview = msg.get('content', '')[:50] + ('...' if len(msg.get('content', '')) > 50 else '')
-            #         timestamp = msg.get('timestamp', 'N/A')
-            #         unique_usernames.add(username)
-            #         print(f"  {i:3d}. User: {username:30s} | Content: {content_preview}")
+            if messages:
+                print(f"\n  ALL MESSAGES FOUND IN '{channel_name}':")
+                print(f"  {'-'*60}")
+                unique_usernames = set()
+                for i, msg in enumerate(messages, 1):
+                    username = msg.get('username', 'Unknown')
+                    content_preview = msg.get('content', '')[:50] + ('...' if len(msg.get('content', '')) > 50 else '')
+                    timestamp = msg.get('timestamp', 'N/A')
+                    unique_usernames.add(username)
+                    print(f"  {i:3d}. User: {username:30s} | Content: {content_preview}")
                 
-            #     print(f"\n  Unique usernames found ({len(unique_usernames)}):")
-            #     for uname in sorted(unique_usernames):
-            #         print(f"    - {uname}")
-            #     print(f"  {'-'*60}\n")
+                print(f"\n  Unique usernames found ({len(unique_usernames)}):")
+                for uname in sorted(unique_usernames):
+                    print(f"    - {uname}")
+                print(f"  {'-'*60}\n")
             
             # Filter messages by target username - improved matching
             filtered_messages = []
@@ -986,10 +1573,10 @@ class DiscordScraper:
         else:
             print(f"Found {len(channels)} subnet channels. Starting to scrape...\n")
             
-            for i, channel in enumerate(channels, 1):
-                print(f"[{i}/{len(channels)}] Processing subnet: {channel['name']}")
-                await self.scrape_channel(channel['name'], channel.get('href'))
-                await asyncio.sleep(1.5)  # Small delay between channels to avoid rate limiting
+            # for i, channel in enumerate(channels, 1):
+            #     print(f"[{i}/{len(channels)}] Processing subnet: {channel['name']}")
+            #     await self.scrape_channel(channel['name'], channel.get('href'))
+            #     await asyncio.sleep(1.5)  # Small delay between channels to avoid rate limiting
         
         print(f"\n✓ Scraping complete! Found {len(self.messages)} messages from {self.target_username} across {len(channels)} subnets")
     
@@ -1055,7 +1642,7 @@ async def main():
     print("Starting scraper...\n")
     
     # Create and run scraper with hardcoded values
-    scraper = DiscordScraper(target_username="D&C", target_server="bittensor", headless=headless, time_limit_minutes=30)
+    scraper = DiscordScraper(target_username="D&C", target_server="bittensor", headless=headless, scrape_unread_only=True)
     await scraper.run()
 
 
