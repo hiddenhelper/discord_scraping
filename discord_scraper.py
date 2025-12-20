@@ -1282,6 +1282,192 @@ class DiscordScraper:
             import traceback
             traceback.print_exc()
     
+    async def mark_channel_as_read(self):
+        """
+        Mark the current channel as read by scrolling to the bottom.
+        Discord marks channels as read when you scroll to the bottom of the message view.
+        This will update the channel's read state in your Discord account.
+        """
+        try:
+            print(f"  📖 Marking channel as read...")
+            
+            # Find the message container - try multiple approaches
+            message_container = None
+            
+            # Method 1: Look for the main message scroller
+            selectors = [
+                'div[class*="scrollerInner"]',
+                'div[class*="scroller"][class*="message"]',
+                '[class*="messages"]',
+                '[class*="messageContainer"]',
+                'div[class*="scroller"]'
+            ]
+            
+            for selector in selectors:
+                try:
+                    elements = await self.page.query_selector_all(selector)
+                    for elem in elements:
+                        # Check if it's scrollable and in the message area
+                        is_scrollable = await elem.evaluate('el => el.scrollHeight > el.clientHeight')
+                        if is_scrollable:
+                            # Check if it's in the right area (not sidebar)
+                            box = await elem.bounding_box()
+                            if box and box['x'] > 200:  # Message area is on the right
+                                message_container = elem
+                                print(f"  Found message container: {selector}")
+                                break
+                    if message_container:
+                        break
+                except:
+                    continue
+            
+            if not message_container:
+                # Method 2: Find by clicking in message area and finding focused element
+                try:
+                    # Click in the message area to focus it
+                    message_area = await self.page.query_selector('[class*="chat"], [class*="message"], [class*="content"]')
+                    if message_area:
+                        await message_area.click()
+                        await asyncio.sleep(0.2)
+                    
+                    # Find the scrollable container
+                    scrollable = await self.page.query_selector('[class*="scroller"]')
+                    if scrollable:
+                        message_container = scrollable
+                except:
+                    pass
+            
+            if message_container:
+                # Get container info
+                scroll_height = await message_container.evaluate('el => el.scrollHeight')
+                client_height = await message_container.evaluate('el => el.clientHeight')
+                initial_scroll = await message_container.evaluate('el => el.scrollTop')
+                
+                print(f"  Scroll info: height={scroll_height}, client={client_height}, current={initial_scroll}")
+                
+                # Method 1: Use keyboard to scroll to bottom (more reliable)
+                try:
+                    # Focus the message container
+                    await message_container.focus()
+                    await asyncio.sleep(0.2)
+                    
+                    # Press End key to go to bottom
+                    await self.page.keyboard.press('End')
+                    await asyncio.sleep(0.5)
+                    
+                    # Press End again to ensure we're at bottom
+                    await self.page.keyboard.press('End')
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    print(f"  ⚠ Keyboard scroll failed: {e}")
+                
+                # Method 2: Programmatic scroll with multiple attempts
+                max_attempts = 5
+                for attempt in range(max_attempts):
+                    current_scroll = await message_container.evaluate('el => el.scrollTop')
+                    current_height = await message_container.evaluate('el => el.scrollHeight')
+                    current_client = await message_container.evaluate('el => el.clientHeight')
+                    
+                    # Calculate if we're at bottom (with 5px tolerance)
+                    at_bottom = (current_scroll + current_client >= current_height - 5)
+                    
+                    if at_bottom:
+                        print(f"  ✓ Reached bottom after {attempt + 1} attempt(s)")
+                        break
+                    
+                    # Scroll to bottom
+                    await message_container.evaluate('el => el.scrollTop = el.scrollHeight')
+                    await asyncio.sleep(0.3)
+                    
+                    # Trigger scroll events
+                    await message_container.evaluate('''
+                        el => {
+                            // Trigger multiple scroll-related events
+                            const scrollEvent = new Event('scroll', { bubbles: true, cancelable: true });
+                            el.dispatchEvent(scrollEvent);
+                            
+                            // Also trigger scrollend if supported
+                            if ('scrollend' in window) {
+                                const scrollEndEvent = new Event('scrollend', { bubbles: true });
+                                el.dispatchEvent(scrollEndEvent);
+                            }
+                        }
+                    ''')
+                    await asyncio.sleep(0.3)
+                
+                # Final verification and scroll
+                final_scroll = await message_container.evaluate('el => el.scrollTop')
+                final_height = await message_container.evaluate('el => el.scrollHeight')
+                final_client = await message_container.evaluate('el => el.clientHeight')
+                
+                # One more scroll to absolute bottom
+                await message_container.evaluate('el => el.scrollTop = el.scrollHeight')
+                await asyncio.sleep(0.5)
+                
+                # Trigger final scroll event and Discord-specific events
+                await message_container.evaluate('''
+                    el => {
+                        el.scrollTop = el.scrollHeight;
+                        
+                        // Trigger standard scroll event
+                        const scrollEvent = new Event('scroll', { bubbles: true, cancelable: true });
+                        el.dispatchEvent(scrollEvent);
+                        
+                        // Trigger scrollend if supported
+                        if ('scrollend' in window) {
+                            const scrollEndEvent = new Event('scrollend', { bubbles: true });
+                            el.dispatchEvent(scrollEndEvent);
+                        }
+                        
+                        // Trigger input event (Discord sometimes listens to this)
+                        const inputEvent = new Event('input', { bubbles: true });
+                        el.dispatchEvent(inputEvent);
+                        
+                        // Trigger change event
+                        const changeEvent = new Event('change', { bubbles: true });
+                        el.dispatchEvent(changeEvent);
+                    }
+                ''')
+                
+                # Also try to trigger Discord's read state update by interacting with the viewport
+                try:
+                    # Click in the message area to ensure focus
+                    message_area = await self.page.query_selector('[class*="chat"], [class*="message"]')
+                    if message_area:
+                        await message_area.click()
+                        await asyncio.sleep(0.2)
+                except:
+                    pass
+                
+                await asyncio.sleep(1.5)  # Give Discord time to update read state
+                
+                # Verify final position
+                verify_scroll = await message_container.evaluate('el => el.scrollTop')
+                verify_height = await message_container.evaluate('el => el.scrollHeight')
+                verify_client = await message_container.evaluate('el => el.clientHeight')
+                
+                at_bottom_final = (verify_scroll + verify_client >= verify_height - 10)
+                
+                if at_bottom_final:
+                    print(f"  ✓ Channel marked as read (scrolled to bottom: {verify_scroll}/{verify_height})")
+                else:
+                    print(f"  ⚠ May not be at bottom (scroll: {verify_scroll}, height: {verify_height})")
+            else:
+                print(f"  ⚠ Could not find message container to mark as read")
+                # Fallback: Try using keyboard End key on the page
+                try:
+                    await self.page.keyboard.press('End')
+                    await asyncio.sleep(0.5)
+                    await self.page.keyboard.press('End')
+                    await asyncio.sleep(0.5)
+                    print(f"  ✓ Used keyboard fallback to scroll to bottom")
+                except:
+                    print(f"  ✗ Could not mark channel as read")
+        except Exception as e:
+            print(f"  ⚠ Error marking channel as read: {e}")
+            import traceback
+            traceback.print_exc()
+    
     async def scroll_to_load_messages(self, max_scrolls: int = 10):
         """Scroll to load messages - minimal scrolling for unread mode."""
         try:
@@ -1614,6 +1800,12 @@ class DiscordScraper:
                     self.messages.append(msg)
             else:
                 print(f"  - No messages matching '{self.target_username}' in this channel")
+            
+            # Mark channel as read by scrolling to the bottom
+            # This ensures the channel won't show as unread in the next scraping session
+            # Only mark as read if we found messages (meaning there were unread messages)
+            if self.scrape_unread_only and messages:
+                await self.mark_channel_as_read()
             
         except Exception as e:
             print(f"  ✗ Error scraping channel {channel_name}: {e}")
