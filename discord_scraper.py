@@ -987,6 +987,54 @@ class DiscordScraper:
                     if missing:
                         print(f"  ⚠ Missing subnet numbers: {missing[:20]}{'...' if len(missing) > 20 else ''}")
             
+            # Scroll back to top of channel list so first channels are visible
+            # This ensures scrape_channel() can properly check for unread messages
+            print(f"\n  Scrolling back to top of channel list...")
+            try:
+                # Find the channel list container again
+                channel_list_container = None
+                selectors = [
+                    'nav[aria-label*="Channels"]',
+                    'nav[aria-label*="channels"]',
+                    'div[class*="channels"]',
+                    'div[class*="sidebar"]',
+                    '[class*="scroller"][class*="channel"]'
+                ]
+                
+                for selector in selectors:
+                    try:
+                        container = await self.page.query_selector(selector)
+                        if container:
+                            is_scrollable = await container.evaluate('el => el.scrollHeight > el.clientHeight')
+                            if is_scrollable:
+                                channel_list_container = container
+                                break
+                    except:
+                        continue
+                
+                if not channel_list_container:
+                    all_divs = await self.page.query_selector_all('div[class*="scroller"], div[class*="scrollable"]')
+                    for div in all_divs:
+                        try:
+                            is_scrollable = await div.evaluate('el => el.scrollHeight > el.clientHeight')
+                            if is_scrollable:
+                                bounding_box = await div.bounding_box()
+                                if bounding_box and bounding_box['x'] < 300:
+                                    channel_list_container = div
+                                    break
+                        except:
+                            continue
+                
+                if channel_list_container:
+                    # Scroll to top
+                    await channel_list_container.evaluate('el => el.scrollTop = 0')
+                    await asyncio.sleep(0.5)
+                    print(f"  ✓ Scrolled to top of channel list")
+                else:
+                    print(f"  ⚠ Could not find channel list container to scroll to top")
+            except Exception as e:
+                print(f"  ⚠ Error scrolling to top: {e}")
+            
             return filtered_channels
             
         except Exception as e:
@@ -1943,6 +1991,10 @@ class DiscordScraper:
 
 async def main():
     """Main entry point."""
+    import time
+    
+    start_time = time.time()
+    
     print("="*60)
     print("Discord Message Scraper - Bittensor Subnets")
     print("="*60)
@@ -1965,6 +2017,26 @@ async def main():
     # Create and run scraper with hardcoded values
     scraper = DiscordScraper(target_username="consτ [τ, τ]", target_server="bittensor", headless=headless, scrape_unread_only=True)
     await scraper.run()
+    
+    # Calculate and display execution time
+    end_time = time.time()
+    duration = end_time - start_time
+    hours = int(duration // 3600)
+    minutes = int((duration % 3600) // 60)
+    seconds = int(duration % 60)
+    milliseconds = int((duration % 1) * 1000)
+    
+    print("\n" + "="*60)
+    print("Execution Summary")
+    print("="*60)
+    if hours > 0:
+        print(f"Total execution time: {hours}h {minutes}m {seconds}s")
+    elif minutes > 0:
+        print(f"Total execution time: {minutes}m {seconds}s")
+    else:
+        print(f"Total execution time: {seconds}.{milliseconds:03d}s")
+    print(f"({duration:.2f} seconds)")
+    print("="*60)
 
 
 if __name__ == "__main__":
