@@ -1107,21 +1107,119 @@ class DiscordScraper:
             return None
     
     async def channel_has_unread(self, channel_elem) -> bool:
-        """Check if a channel has unread messages by checking if the name is bold."""
+        """
+        Check if a channel has unread messages by checking computed styles.
+        
+        Discord uses CSS variables for channel name colors:
+        - Unread: color: var(--interactive-text-active); font-weight: 500+
+        - Read: color: var(--channels-default); font-weight: normal (400)
+        
+        Since class names are dynamically generated (e.g., _2ea32c412048f708-name),
+        we use computed styles which remain consistent regardless of class name changes.
+        """
         try:
             if not channel_elem:
                 return False
             
             # The channel element should be the <a> tag with href
-            # Find the name div inside it: <div class="_2ea32c412048f708-name ...">
+            # Find the name element inside it (the div with dynamically generated class ending in "-name")
             name_elem = await channel_elem.query_selector('div[class*="name"]')
             
             if not name_elem:
                 # Try alternative selectors
                 name_elem = await channel_elem.query_selector('[class*="name"]')
             
+            if not name_elem:
+                # Try finding any text element inside the channel link
+                name_elem = await channel_elem.query_selector('span, div')
+            
             if name_elem:
-                # Check computed style for font-weight (works even with aria-hidden)
+                # Method 1: Check computed color against CSS variable values
+                # This is the most reliable method as it works regardless of class name changes
+                try:
+                    is_unread_by_color = await name_elem.evaluate('''
+                        el => {
+                            const style = window.getComputedStyle(el);
+                            const elementColor = style.color;
+                            
+                            // Get the CSS variable values from the document root
+                            const rootStyle = getComputedStyle(document.documentElement);
+                            const activeColor = rootStyle.getPropertyValue('--interactive-text-active').trim();
+                            const defaultColor = rootStyle.getPropertyValue('--channels-default').trim();
+                            
+                            // Helper function to parse RGB/RGBA color string to comparable format
+                            const parseColor = (colorStr) => {
+                                if (!colorStr) return null;
+                                // Try to create a temporary element to compute the color
+                                const temp = document.createElement('div');
+                                temp.style.color = colorStr;
+                                document.body.appendChild(temp);
+                                const computed = getComputedStyle(temp).color;
+                                document.body.removeChild(temp);
+                                return computed;
+                            };
+                            
+                            // Compare element color with the active color (unread indicator)
+                            const activeColorComputed = parseColor(activeColor);
+                            const defaultColorComputed = parseColor(defaultColor);
+                            
+                            // If element color matches active color, it's unread
+                            if (activeColorComputed && elementColor === activeColorComputed) {
+                                return true;
+                            }
+                            
+                            // If element color matches default color, it's read
+                            if (defaultColorComputed && elementColor === defaultColorComputed) {
+                                return false;
+                            }
+                            
+                            // Alternative check: Compare raw RGB values
+                            // Parse RGB values from color strings like "rgb(255, 255, 255)" or "rgba(255, 255, 255, 1)"
+                            const parseRGB = (color) => {
+                                const match = color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+                                if (match) {
+                                    return { r: parseInt(match[1]), g: parseInt(match[2]), b: parseInt(match[3]) };
+                                }
+                                return null;
+                            };
+                            
+                            const elemRGB = parseRGB(elementColor);
+                            const activeRGB = activeColorComputed ? parseRGB(activeColorComputed) : null;
+                            const defaultRGB = defaultColorComputed ? parseRGB(defaultColorComputed) : null;
+                            
+                            // Check if element color is closer to active (unread) or default (read)
+                            if (elemRGB && activeRGB && defaultRGB) {
+                                // Calculate color distance
+                                const distToActive = Math.sqrt(
+                                    Math.pow(elemRGB.r - activeRGB.r, 2) +
+                                    Math.pow(elemRGB.g - activeRGB.g, 2) +
+                                    Math.pow(elemRGB.b - activeRGB.b, 2)
+                                );
+                                const distToDefault = Math.sqrt(
+                                    Math.pow(elemRGB.r - defaultRGB.r, 2) +
+                                    Math.pow(elemRGB.g - defaultRGB.g, 2) +
+                                    Math.pow(elemRGB.b - defaultRGB.b, 2)
+                                );
+                                
+                                // If closer to active color (and significantly different from default), it's unread
+                                if (distToActive < distToDefault && distToActive < 50) {
+                                    return true;
+                                }
+                            }
+                            
+                            return null;  // Could not determine by color
+                        }
+                    ''')
+                    
+                    if is_unread_by_color is True:
+                        return True
+                    elif is_unread_by_color is False:
+                        return False
+                    # If null, continue to other checks
+                except Exception as e:
+                    pass
+                
+                # Method 2: Check font-weight (Discord uses 500+ for unread channels)
                 try:
                     font_weight = await name_elem.evaluate('el => window.getComputedStyle(el).fontWeight')
                     
@@ -1141,16 +1239,23 @@ class DiscordScraper:
                 except Exception as e:
                     pass
                 
-                # Also check if the element itself has bold styling via CSS
+                # Method 3: Check font-weight via alternative approach
                 try:
-                    # Check computed font-weight including inherited styles
-                    is_bold = await name_elem.evaluate('el => { const style = window.getComputedStyle(el); const fw = style.fontWeight; if (fw === "bold") return true; const fwNum = parseInt(fw); return fwNum >= 500; }')
+                    is_bold = await name_elem.evaluate('''
+                        el => {
+                            const style = window.getComputedStyle(el);
+                            const fw = style.fontWeight;
+                            if (fw === "bold") return true;
+                            const fwNum = parseInt(fw);
+                            return fwNum >= 500;
+                        }
+                    ''')
                     if is_bold:
                         return True
                 except:
                     pass
             
-            # Check the <a> element itself for bold styling
+            # Method 4: Check the <a> element itself for bold styling
             try:
                 link_font_weight = await channel_elem.evaluate('el => window.getComputedStyle(el).fontWeight')
                 if link_font_weight:
@@ -1165,12 +1270,12 @@ class DiscordScraper:
             except:
                 pass
             
-            # Check for unread class on the channel element or its parents
+            # Method 5: Check for unread class on the channel element or its parents
             channel_class = await channel_elem.get_attribute('class') or ""
             if 'unread' in channel_class.lower():
                 return True
             
-            # Check parent wrapper for unread indicators
+            # Method 6: Check parent wrapper for unread indicators
             try:
                 parent = await channel_elem.evaluate_handle('el => el.parentElement')
                 if parent:
@@ -1192,10 +1297,40 @@ class DiscordScraper:
             except:
                 pass
             
-            # Check for unread badge
+            # Method 7: Check for unread badge/pill indicator
             unread_badge = await channel_elem.query_selector('[class*="unread"], [class*="unreadBadge"], [class*="unreadCount"]')
             if unread_badge:
                 return True
+            
+            # Method 8: Check for the small white pill/indicator on the left side of unread channels
+            try:
+                # Discord shows a small white pill on the left side of unread channels
+                unread_pill = await channel_elem.evaluate('''
+                    el => {
+                        // Check parent and siblings for unread indicators
+                        const parent = el.parentElement;
+                        if (!parent) return false;
+                        
+                        // Look for elements with opacity or visibility indicating unread
+                        const siblings = parent.querySelectorAll('div, span');
+                        for (const sib of siblings) {
+                            const style = window.getComputedStyle(sib);
+                            // The unread pill is usually a small white element with specific dimensions
+                            if (sib.offsetWidth > 0 && sib.offsetWidth < 10 && sib.offsetHeight > 5) {
+                                const bgColor = style.backgroundColor;
+                                // White or light-colored background indicates unread pill
+                                if (bgColor && bgColor !== 'rgba(0, 0, 0, 0)' && bgColor !== 'transparent') {
+                                    return true;
+                                }
+                            }
+                        }
+                        return false;
+                    }
+                ''')
+                if unread_pill:
+                    return True
+            except:
+                pass
             
             return False
         except Exception as e:
