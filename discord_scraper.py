@@ -9,13 +9,22 @@ import asyncio
 import json
 import re
 import time
+import aiohttp
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 from playwright.async_api import async_playwright, Page, Browser
 
 
 class DiscordScraper:
-    def __init__(self, target_username: str = "consτ [τ, τ]", target_server: str = "bittensor", headless: bool = False, scrape_unread_only: bool = True):
+    def __init__(
+        self, 
+        target_username: str = "consτ [τ, τ]", 
+        target_server: str = "bittensor", 
+        headless: bool = False, 
+        scrape_unread_only: bool = True,
+        telegram_bot_token: Optional[str] = None,
+        telegram_chat_id: Optional[str] = None
+    ):
         """
         Initialize the Discord scraper.
         
@@ -24,6 +33,8 @@ class DiscordScraper:
             target_server: The server name to scrape (default: "bittensor")
             headless: Whether to run browser in headless mode
             scrape_unread_only: Only scrape unread messages (default: True) - faster and avoids duplicates
+            telegram_bot_token: Telegram Bot API token (from @BotFather)
+            telegram_chat_id: Telegram chat/channel ID to send messages to
         """
         self.target_username = target_username
         self.target_server = target_server.lower()
@@ -32,11 +43,19 @@ class DiscordScraper:
         self.messages: List[Dict] = []
         self.browser: Optional[Browser] = None
         self.page: Optional[Page] = None
+        self._channel_list_container = None  # Cached channel list container
+        
+        # Telegram configuration
+        self.telegram_bot_token = "8218166853:AAFVYr5y3yK-dPCM_89d4Te8pXraSWskyiM"
+        self.telegram_chat_id = "7665326469"
         
         if scrape_unread_only:
             print(f"📬 Mode: Only scraping UNREAD messages (faster, avoids duplicates)")
         else:
             print(f"📬 Mode: Scraping all messages")
+        
+        if telegram_bot_token and telegram_chat_id:
+            print(f"📱 Telegram: Will send results to chat {telegram_chat_id}")
         
     async def setup_browser(self):
         """Initialize browser and navigate to Discord."""
@@ -101,7 +120,7 @@ class DiscordScraper:
         target_lower = self.target_server.lower()
         
         # Wait a bit for Discord to fully load
-        await asyncio.sleep(3)
+        await asyncio.sleep(2)  # Reduced from 3s
         
         while time.time() - start_time < timeout:
             try:
@@ -173,7 +192,7 @@ class DiscordScraper:
                 
                 if not server_elements:
                     print("⚠ No server elements found, waiting...")
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(1)  # Reduced from 2s
                     continue
                 
                 print(f"\nAnalyzing {len(server_elements)} potential server elements...")
@@ -311,7 +330,7 @@ class DiscordScraper:
                         # Scroll element into view if needed
                         try:
                             await best_match['element'].scroll_into_view_if_needed()
-                            await asyncio.sleep(0.5)
+                            await asyncio.sleep(0.3)  # Reduced from 0.5s
                         except:
                             pass
                         
@@ -337,10 +356,10 @@ class DiscordScraper:
                                     pass
                         
                         if clicked:
-                            await asyncio.sleep(3)  # Wait for server to load
+                            await asyncio.sleep(2)  # Reduced from 3s - Wait for server to load
                             
                             # Verify we're on the right server by checking the page
-                            await asyncio.sleep(2)
+                            await asyncio.sleep(1)  # Reduced from 2s
                             
                             # Try to verify server name from page
                             try:
@@ -372,7 +391,7 @@ class DiscordScraper:
                             print(f"   Searched through {len(found_servers)} servers but none matched.")
                             print(f"   Please check the server list above and verify '{self.target_server}' is present.")
                 
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)  # Reduced from 2s
                 
             except Exception as e:
                 print(f"Error during server search: {e}")
@@ -381,7 +400,7 @@ class DiscordScraper:
         print(f"\n⚠ Could not automatically find '{self.target_server}' server.")
         print(f"Please manually navigate to the '{self.target_server}' server in the browser.")
         input("Press Enter once you're on the Bittensor server...")
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)  # Reduced from 2s
         return True
         
     async def wait_for_login(self, timeout: int = 300):
@@ -403,7 +422,7 @@ class DiscordScraper:
                     elements = await self.page.query_selector_all(selector)
                     if elements:
                         print("✓ Login detected! Starting to scrape...")
-                        await asyncio.sleep(2)  # Give UI time to fully load
+                        await asyncio.sleep(1)  # Reduced from 2s - Give UI time to fully load
                         return True
                 
                 await asyncio.sleep(1)
@@ -411,6 +430,64 @@ class DiscordScraper:
                 await asyncio.sleep(1)
         
         raise TimeoutError("Login timeout. Please ensure you've logged in to Discord.")
+    
+    async def get_channel_list_container(self, force_refresh: bool = False):
+        """
+        Get the channel list container (left sidebar), using cache when available.
+        
+        Args:
+            force_refresh: If True, ignore cache and find container again
+            
+        Returns:
+            The channel list container element, or None if not found
+        """
+        # Return cached container if valid
+        if not force_refresh and self._channel_list_container:
+            try:
+                # Verify the cached container is still valid/attached to DOM
+                is_connected = await self._channel_list_container.evaluate('el => el.isConnected')
+                if is_connected:
+                    return self._channel_list_container
+            except:
+                pass  # Container is stale, need to find again
+        
+        # Find the channel list container
+        selectors = [
+            'nav[aria-label*="Channels"]',
+            'nav[aria-label*="channels"]',
+            'div[class*="channels"]',
+            'div[class*="sidebar"]',
+            '[class*="scroller"][class*="channel"]'
+        ]
+        
+        for selector in selectors:
+            try:
+                container = await self.page.query_selector(selector)
+                if container:
+                    is_scrollable = await container.evaluate('el => el.scrollHeight > el.clientHeight')
+                    if is_scrollable:
+                        self._channel_list_container = container
+                        return container
+            except:
+                continue
+        
+        # Fallback: find scrollable div in sidebar area
+        try:
+            all_divs = await self.page.query_selector_all('div[class*="scroller"], div[class*="scrollable"]')
+            for div in all_divs:
+                try:
+                    is_scrollable = await div.evaluate('el => el.scrollHeight > el.clientHeight')
+                    if is_scrollable:
+                        bounding_box = await div.bounding_box()
+                        if bounding_box and bounding_box['x'] < 300:  # Sidebar is on the left
+                            self._channel_list_container = div
+                            return div
+                except:
+                    continue
+        except:
+            pass
+        
+        return None
     
     async def expand_all_categories(self, scroll_container=None):
         """Expand all collapsed channel categories to show all channels."""
@@ -492,57 +569,20 @@ class DiscordScraper:
             
             # First, expand all categories
             await self.expand_all_categories()
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)  # Reduced from 1s
             
-            # Find the channel list container (left sidebar)
-            channel_list_selectors = [
-                'nav[aria-label*="Channels"]',
-                'nav[aria-label*="channels"]',
-                'div[class*="channels"]',
-                'div[class*="sidebar"]',
-                '[class*="scroller"][class*="channel"]',
-                'div[class*="list"]'
-            ]
-            
-            channel_list_container = None
-            for selector in channel_list_selectors:
-                try:
-                    container = await self.page.query_selector(selector)
-                    if container:
-                        # Check if it's scrollable
-                        is_scrollable = await container.evaluate('el => el.scrollHeight > el.clientHeight')
-                        if is_scrollable:
-                            channel_list_container = container
-                            print(f"  Found scrollable channel list container")
-                            break
-                except:
-                    continue
-            
-            # If no specific container found, try to find any scrollable element in the sidebar
-            if not channel_list_container:
-                # Look for scrollable divs in the sidebar area
-                all_divs = await self.page.query_selector_all('div[class*="scroller"], div[class*="scrollable"]')
-                for div in all_divs:
-                    try:
-                        is_scrollable = await div.evaluate('el => el.scrollHeight > el.clientHeight')
-                        if is_scrollable:
-                            # Check if it's in the sidebar (left side of page)
-                            bounding_box = await div.bounding_box()
-                            if bounding_box and bounding_box['x'] < 300:  # Sidebar is on the left
-                                channel_list_container = div
-                                print(f"  Found scrollable sidebar container")
-                                break
-                    except:
-                        continue
+            # Use cached channel list container
+            channel_list_container = await self.get_channel_list_container()
             
             if channel_list_container:
+                print(f"  Found scrollable channel list container")
                 last_height = 0
                 scroll_count = 0
                 no_change_count = 0
                 
                 # Start from top
                 await channel_list_container.evaluate('el => el.scrollTop = 0')
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.3)  # Reduced from 0.5s
                 
                 for i in range(max_scrolls):
                     # Get current measurements
@@ -554,7 +594,7 @@ class DiscordScraper:
                     scroll_amount = client_height * 0.8  # Scroll 80% of viewport
                     new_scroll = scroll_top + scroll_amount
                     await channel_list_container.evaluate(f'el => el.scrollTop = {new_scroll}')
-                    await asyncio.sleep(0.4)  # Wait for channels to load
+                    await asyncio.sleep(0.2)  # Reduced from 0.4s - Wait for channels to load
                     
                     # Check if we've reached the bottom
                     new_scroll_top = await channel_list_container.evaluate('el => el.scrollTop')
@@ -586,7 +626,7 @@ class DiscordScraper:
                 
                 # Scroll back to top
                 await channel_list_container.evaluate('el => el.scrollTop = 0')
-                await asyncio.sleep(1)  # Wait for DOM to settle
+                await asyncio.sleep(0.5)  # Reduced from 1s - Wait for DOM to settle
             else:
                 print("  ⚠ Could not find scrollable channel list container, proceeding with visible channels only")
                 
@@ -601,48 +641,17 @@ class DiscordScraper:
         seen_hrefs = set()
         
         try:
-            # Find the channel list container
-            channel_list_container = None
-            selectors = [
-                'nav[aria-label*="Channels"]',
-                'nav[aria-label*="channels"]',
-                'div[class*="channels"]',
-                'div[class*="sidebar"]',
-                '[class*="scroller"][class*="channel"]'
-            ]
-            
-            for selector in selectors:
-                try:
-                    container = await self.page.query_selector(selector)
-                    if container:
-                        is_scrollable = await container.evaluate('el => el.scrollHeight > el.clientHeight')
-                        if is_scrollable:
-                            channel_list_container = container
-                            break
-                except:
-                    continue
-            
-            if not channel_list_container:
-                all_divs = await self.page.query_selector_all('div[class*="scroller"], div[class*="scrollable"]')
-                for div in all_divs:
-                    try:
-                        is_scrollable = await div.evaluate('el => el.scrollHeight > el.clientHeight')
-                        if is_scrollable:
-                            bounding_box = await div.bounding_box()
-                            if bounding_box and bounding_box['x'] < 300:
-                                channel_list_container = div
-                                break
-                    except:
-                        continue
+            # Use cached channel list container
+            channel_list_container = await self.get_channel_list_container()
             
             if channel_list_container:
                 # Start from top
                 await channel_list_container.evaluate('el => el.scrollTop = 0')
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.3)  # Reduced from 0.5s
                 
                 # Expand categories at the start
                 await self.expand_all_categories(scroll_container=channel_list_container)
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.3)  # Reduced from 0.5s
                 
                 last_height = 0
                 scroll_count = 0
@@ -677,11 +686,11 @@ class DiscordScraper:
                     if scroll_top + client_height >= current_height - 5:  # 5px tolerance
                         # Try scrolling to absolute bottom one more time
                         await channel_list_container.evaluate('el => el.scrollTop = el.scrollHeight')
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(0.3)  # Reduced from 0.5s
                         
                         # Expand categories one final time at bottom
                         await self.expand_all_categories(scroll_container=channel_list_container)
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(0.3)  # Reduced from 0.5s
                         
                         # Final collection at bottom
                         final_links = await self.page.query_selector_all('a[href^="/channels/"]')
@@ -700,7 +709,7 @@ class DiscordScraper:
                     scroll_amount = client_height * 0.75  # Slightly smaller increments
                     new_scroll = scroll_top + scroll_amount
                     await channel_list_container.evaluate(f'el => el.scrollTop = {new_scroll}')
-                    await asyncio.sleep(0.4)
+                    await asyncio.sleep(0.2)  # Reduced from 0.4s
                     
                     new_height = await channel_list_container.evaluate('el => el.scrollHeight')
                     
@@ -714,7 +723,7 @@ class DiscordScraper:
                     if new_height == last_height and no_change_count > 3 and i > 10:
                         # Try scrolling to bottom one more time
                         await channel_list_container.evaluate('el => el.scrollTop = el.scrollHeight')
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(0.3)  # Reduced from 0.5s
                         break
                     
                     last_height = new_height
@@ -728,7 +737,7 @@ class DiscordScraper:
                 
                 # Scroll back to top
                 await channel_list_container.evaluate('el => el.scrollTop = 0')
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.3)  # Reduced from 0.5s
             
             return all_channel_elements
             
@@ -748,7 +757,7 @@ class DiscordScraper:
         try:
             # Wait for channels to load
             await self.page.wait_for_selector('[class*="channel"], [class*="channelText"], [data-list-item-id*="channel"]', timeout=10000)
-            await asyncio.sleep(2)  # Give extra time for channels to render
+            await asyncio.sleep(1)  # Reduced from 2s - Give extra time for channels to render
             
             print("\nCollecting all channels while scrolling...")
             # Collect channels incrementally while scrolling (this also expands categories)
@@ -757,41 +766,17 @@ class DiscordScraper:
             # One more pass: scroll to bottom and expand categories there
             print("\nFinal pass: Ensuring we reach 'subnets 3' category...")
             try:
-                # Find scroll container again
-                channel_list_container = None
-                selectors = ['nav[aria-label*="Channels"]', 'div[class*="channels"]', 'div[class*="scroller"]']
-                for selector in selectors:
-                    try:
-                        container = await self.page.query_selector(selector)
-                        if container:
-                            is_scrollable = await container.evaluate('el => el.scrollHeight > el.clientHeight')
-                            if is_scrollable:
-                                channel_list_container = container
-                                break
-                    except:
-                        continue
-                
-                if not channel_list_container:
-                    all_divs = await self.page.query_selector_all('div[class*="scroller"], div[class*="scrollable"]')
-                    for div in all_divs:
-                        try:
-                            is_scrollable = await div.evaluate('el => el.scrollHeight > el.clientHeight')
-                            if is_scrollable:
-                                bounding_box = await div.bounding_box()
-                                if bounding_box and bounding_box['x'] < 300:
-                                    channel_list_container = div
-                                    break
-                        except:
-                            continue
+                # Use cached container
+                channel_list_container = await self.get_channel_list_container()
                 
                 if channel_list_container:
                     # Scroll all the way to bottom
                     await channel_list_container.evaluate('el => el.scrollTop = el.scrollHeight')
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0.5)  # Reduced from 1s
                     
                     # Expand categories at bottom (including "subnets 3")
                     await self.expand_all_categories(scroll_container=channel_list_container)
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0.5)  # Reduced from 1s
                     
                     # Collect any new channels from bottom
                     bottom_links = await self.page.query_selector_all('a[href^="/channels/"]')
@@ -820,7 +805,7 @@ class DiscordScraper:
             except Exception as e:
                 print(f"  ⚠ Error in final bottom pass: {e}")
             
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)  # Reduced from 1s
             
             # Final collection pass - get all channel links one more time
             final_channel_links = await self.page.query_selector_all('a[href^="/channels/"]')
@@ -991,44 +976,13 @@ class DiscordScraper:
             # This ensures scrape_channel() can properly check for unread messages
             print(f"\n  Scrolling back to top of channel list...")
             try:
-                # Find the channel list container again
-                channel_list_container = None
-                selectors = [
-                    'nav[aria-label*="Channels"]',
-                    'nav[aria-label*="channels"]',
-                    'div[class*="channels"]',
-                    'div[class*="sidebar"]',
-                    '[class*="scroller"][class*="channel"]'
-                ]
-                
-                for selector in selectors:
-                    try:
-                        container = await self.page.query_selector(selector)
-                        if container:
-                            is_scrollable = await container.evaluate('el => el.scrollHeight > el.clientHeight')
-                            if is_scrollable:
-                                channel_list_container = container
-                                break
-                    except:
-                        continue
-                
-                if not channel_list_container:
-                    all_divs = await self.page.query_selector_all('div[class*="scroller"], div[class*="scrollable"]')
-                    for div in all_divs:
-                        try:
-                            is_scrollable = await div.evaluate('el => el.scrollHeight > el.clientHeight')
-                            if is_scrollable:
-                                bounding_box = await div.bounding_box()
-                                if bounding_box and bounding_box['x'] < 300:
-                                    channel_list_container = div
-                                    break
-                        except:
-                            continue
+                # Use cached container
+                channel_list_container = await self.get_channel_list_container()
                 
                 if channel_list_container:
                     # Scroll to top
                     await channel_list_container.evaluate('el => el.scrollTop = 0')
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.3)  # Reduced from 0.5s
                     print(f"  ✓ Scrolled to top of channel list")
                 else:
                     print(f"  ⚠ Could not find channel list container to scroll to top")
@@ -1413,8 +1367,8 @@ class DiscordScraper:
             if not message_container:
                 return
             
-            # Wait longer for Discord to auto-scroll to unread messages (if many unread)
-            await asyncio.sleep(2)
+            # Wait for Discord to auto-scroll to unread messages (if many unread)
+            await asyncio.sleep(1)  # Reduced from 2s
             
             # Check if we're already at unread messages (Discord auto-scrolled)
             has_unread_marker = await self.has_unread_messages_in_view()
@@ -1433,7 +1387,7 @@ class DiscordScraper:
                         relative_y = marker_y - container_y
                         # Scroll to show messages around the marker
                         await message_container.evaluate(f'el => el.scrollTop = {max(0, relative_y - 200)}')
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(0.3)  # Reduced from 0.5s
                 
                 # Scroll down from marker to load all unread messages
                 for i in range(5):  # Scroll down a few times to load unread messages
@@ -1532,15 +1486,15 @@ class DiscordScraper:
                 try:
                     # Focus the message container
                     await message_container.focus()
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.1)  # Reduced from 0.2s
                     
                     # Press End key to go to bottom
                     await self.page.keyboard.press('End')
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.3)  # Reduced from 0.5s
                     
                     # Press End again to ensure we're at bottom
                     await self.page.keyboard.press('End')
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.3)  # Reduced from 0.5s
                 except Exception as e:
                     print(f"  ⚠ Keyboard scroll failed: {e}")
                 
@@ -1585,7 +1539,7 @@ class DiscordScraper:
                 
                 # One more scroll to absolute bottom
                 await message_container.evaluate('el => el.scrollTop = el.scrollHeight')
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.3)  # Reduced from 0.5s
                 
                 # Trigger final scroll event and Discord-specific events
                 await message_container.evaluate('''
@@ -1622,7 +1576,7 @@ class DiscordScraper:
                 except:
                     pass
                 
-                await asyncio.sleep(1.5)  # Give Discord time to update read state
+                await asyncio.sleep(0.8)  # Reduced from 1.5s - Give Discord time to update read state
                 
                 # Verify final position
                 verify_scroll = await message_container.evaluate('el => el.scrollTop')
@@ -1640,9 +1594,9 @@ class DiscordScraper:
                 # Fallback: Try using keyboard End key on the page
                 try:
                     await self.page.keyboard.press('End')
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.3)  # Reduced from 0.5s
                     await self.page.keyboard.press('End')
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.3)  # Reduced from 0.5s
                     print(f"  ✓ Used keyboard fallback to scroll to bottom")
                 except:
                     print(f"  ✗ Could not mark channel as read")
@@ -1690,15 +1644,15 @@ class DiscordScraper:
         messages = []
         
         try:
-            # Wait longer for Discord to auto-scroll to unread messages (if many unread)
+            # Wait for Discord to auto-scroll to unread messages (if many unread)
             # Discord needs time to position the view at unread messages
-            await asyncio.sleep(2.5)
+            await asyncio.sleep(1.5)  # Reduced from 2.5s
             
             # Scroll to load messages (handles unread messages appropriately)
             await self.scroll_to_load_messages()
             
             # Wait a bit more for messages to render after scrolling
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)  # Reduced from 1s
             
             # Try multiple selectors for message elements
             message_selectors = [
@@ -1899,16 +1853,16 @@ class DiscordScraper:
                     channel_link = await self.page.query_selector(f'a[href*="{channel_href}"]')
                     if channel_link:
                         await channel_link.click()
-                        await asyncio.sleep(1.5)  # Reduced wait time
+                        await asyncio.sleep(1)  # Reduced from 1.5s
                     else:
                         # Alternative: try to find and click by text
                         await self.page.click(f'text={channel_name}')
-                        await asyncio.sleep(1.5)
+                        await asyncio.sleep(1)  # Reduced from 1.5s
                 except:
                     # Alternative: try to find and click by text
                     try:
                         await self.page.click(f'text={channel_name}')
-                        await asyncio.sleep(1.5)
+                        await asyncio.sleep(1)  # Reduced from 1.5s
                     except:
                         pass
             
@@ -2071,7 +2025,7 @@ class DiscordScraper:
             for i, channel in enumerate(channels, 1):
                 print(f"[{i}/{len(channels)}] Processing subnet: {channel['name']}")
                 await self.scrape_channel(channel['name'], channel.get('href'))
-                await asyncio.sleep(1.5)  # Small delay between channels to avoid rate limiting
+                await asyncio.sleep(0.8)  # Reduced from 1.5s - Small delay between channels
         
         # Count messages from user vs messages mentioning user
         from_user = sum(1 for msg in self.messages 
@@ -2083,6 +2037,150 @@ class DiscordScraper:
             print(f"  - {from_user} message(s) FROM '{self.target_username}'")
         if mentioning_user > 0:
             print(f"  - {mentioning_user} message(s) MENTIONING '{self.target_username}'")
+    
+    async def send_to_telegram(self) -> bool:
+        """
+        Send scraped messages to Telegram channel.
+        
+        Returns:
+            True if messages were sent successfully, False otherwise
+        """
+        if not self.telegram_bot_token or not self.telegram_chat_id:
+            print("⚠ Telegram not configured (missing bot token or chat ID)")
+            return False
+        
+        if not self.messages:
+            print("⚠ No messages to send to Telegram")
+            return False
+        
+        print(f"\n📱 Sending {len(self.messages)} messages to Telegram...")
+        
+        telegram_api_url = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                # Send a summary header first
+                header_text = (
+                    f"🔔 *Discord Scraper Results*\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📍 Server: `{self.target_server}`\n"
+                    f"👤 User: `{self.target_username}`\n"
+                    f"📊 Messages found: *{len(self.messages)}*\n"
+                    f"🕐 Scraped at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━"
+                )
+                
+                # Send header
+                async with session.post(telegram_api_url, json={
+                    "chat_id": self.telegram_chat_id,
+                    "text": header_text,
+                    "parse_mode": "Markdown"
+                }) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        print(f"  ✗ Failed to send header: {error_text}")
+                        return False
+                    print(f"  ✓ Sent summary header")
+                
+                await asyncio.sleep(0.5)  # Rate limiting
+                
+                # Group messages by channel
+                messages_by_channel: Dict[str, List[Dict]] = {}
+                for msg in self.messages:
+                    channel = msg.get('channel', 'Unknown')
+                    if channel not in messages_by_channel:
+                        messages_by_channel[channel] = []
+                    messages_by_channel[channel].append(msg)
+                
+                # Send messages grouped by channel
+                sent_count = 0
+                for channel, channel_messages in messages_by_channel.items():
+                    # Format messages for this channel
+                    message_texts = []
+                    for msg in channel_messages:
+                        username = msg.get('username', 'Unknown')
+                        content = msg.get('content', '')
+                        timestamp = msg.get('timestamp', '')
+                        
+                        # Escape special Markdown characters in content
+                        content_escaped = content.replace('_', '\\_').replace('*', '\\*').replace('`', '\\`').replace('[', '\\[')
+                        
+                        # Truncate long messages
+                        if len(content_escaped) > 500:
+                            content_escaped = content_escaped[:500] + "..."
+                        
+                        message_texts.append(
+                            f"👤 *{username}*\n"
+                            f"💬 {content_escaped}\n"
+                            f"🕐 _{timestamp}_"
+                        )
+                    
+                    # Combine messages for this channel
+                    channel_text = f"📢 *Channel: #{channel}*\n\n" + "\n\n───────────\n\n".join(message_texts)
+                    
+                    # Split if too long (Telegram limit is 4096 chars)
+                    if len(channel_text) > 4000:
+                        # Send in chunks
+                        chunks = []
+                        current_chunk = f"📢 *Channel: #{channel}* (continued)\n\n"
+                        
+                        for msg_text in message_texts:
+                            if len(current_chunk) + len(msg_text) + 20 > 4000:
+                                chunks.append(current_chunk)
+                                current_chunk = f"📢 *Channel: #{channel}* (continued)\n\n"
+                            current_chunk += msg_text + "\n\n───────────\n\n"
+                        
+                        if current_chunk.strip():
+                            chunks.append(current_chunk)
+                        
+                        # Send each chunk
+                        for i, chunk in enumerate(chunks):
+                            async with session.post(telegram_api_url, json={
+                                "chat_id": self.telegram_chat_id,
+                                "text": chunk,
+                                "parse_mode": "Markdown"
+                            }) as response:
+                                if response.status == 200:
+                                    sent_count += 1
+                                else:
+                                    # Try without Markdown if it fails
+                                    async with session.post(telegram_api_url, json={
+                                        "chat_id": self.telegram_chat_id,
+                                        "text": chunk.replace('*', '').replace('_', '').replace('`', '')
+                                    }) as retry_response:
+                                        if retry_response.status == 200:
+                                            sent_count += 1
+                            await asyncio.sleep(0.3)  # Rate limiting
+                    else:
+                        # Send as single message
+                        async with session.post(telegram_api_url, json={
+                            "chat_id": self.telegram_chat_id,
+                            "text": channel_text,
+                            "parse_mode": "Markdown"
+                        }) as response:
+                            if response.status == 200:
+                                sent_count += 1
+                            else:
+                                # Try without Markdown if it fails
+                                async with session.post(telegram_api_url, json={
+                                    "chat_id": self.telegram_chat_id,
+                                    "text": channel_text.replace('*', '').replace('_', '').replace('`', '')
+                                }) as retry_response:
+                                    if retry_response.status == 200:
+                                        sent_count += 1
+                        await asyncio.sleep(0.3)  # Rate limiting
+                
+                print(f"  ✓ Sent {sent_count} message groups to Telegram")
+                return True
+                
+        except aiohttp.ClientError as e:
+            print(f"  ✗ Network error sending to Telegram: {e}")
+            return False
+        except Exception as e:
+            print(f"  ✗ Error sending to Telegram: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
     
     async def save_results(self, filename: str = None):
         """Save scraped messages to a JSON file."""
@@ -2103,6 +2201,40 @@ class DiscordScraper:
         print(f"\n✓ Results saved to: {filename}")
         return filename
     
+    async def send_no_messages_notification(self):
+        """Send a notification to Telegram when no messages are found."""
+        if not self.telegram_bot_token or not self.telegram_chat_id:
+            return False
+        
+        telegram_api_url = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
+        
+        notification_text = (
+            f"📭 *No Messages Found*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📍 Server: `{self.target_server}`\n"
+            f"👤 User: `{self.target_username}`\n"
+            f"🕐 Checked at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"No new messages from the target user were found."
+        )
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(telegram_api_url, json={
+                    "chat_id": self.telegram_chat_id,
+                    "text": notification_text,
+                    "parse_mode": "Markdown"
+                }) as response:
+                    if response.status == 200:
+                        print("📱 Sent 'no messages found' notification to Telegram")
+                        return True
+                    else:
+                        print(f"⚠ Failed to send Telegram notification: {response.status}")
+                        return False
+        except Exception as e:
+            print(f"⚠ Error sending Telegram notification: {e}")
+            return False
+    
     async def run(self):
         """Main execution method."""
         try:
@@ -2111,8 +2243,16 @@ class DiscordScraper:
             
             if self.messages:
                 await self.save_results()
+                
+                # Send to Telegram if configured
+                if self.telegram_bot_token and self.telegram_chat_id:
+                    await self.send_to_telegram()
             else:
                 print("\n⚠ No messages found from the target user.")
+                
+                # Send "no messages" notification to Telegram if configured
+                if self.telegram_bot_token and self.telegram_chat_id:
+                    await self.send_no_messages_notification()
             
         except Exception as e:
             print(f"\n✗ Error: {e}")
@@ -2126,7 +2266,7 @@ class DiscordScraper:
 
 async def main():
     """Main entry point."""
-    import time
+    import os
     
     start_time = time.time()
     
@@ -2146,11 +2286,33 @@ async def main():
         print("\nUsing default: headless=False (browser will be visible)")
         headless = False
     
+    # Telegram configuration - can be set via environment variables or here
+    # Set these environment variables or replace with your values:
+    #   TELEGRAM_BOT_TOKEN - Get from @BotFather on Telegram
+    #   TELEGRAM_CHAT_ID - Your channel/chat ID (e.g., -1001234567890 for channels)
+    telegram_bot_token = os.environ.get('TELEGRAM_BOT_TOKEN', None)
+    telegram_chat_id = os.environ.get('TELEGRAM_CHAT_ID', None)
+    
+    # Uncomment and set these if you prefer hardcoding:
+    # telegram_bot_token = "YOUR_BOT_TOKEN_HERE"
+    # telegram_chat_id = "YOUR_CHAT_ID_HERE"
+    
     print(f"\nBrowser mode: {'headless' if headless else 'visible'}")
+    if telegram_bot_token and telegram_chat_id:
+        print(f"Telegram: Enabled (chat ID: {telegram_chat_id})")
+    else:
+        print("Telegram: Disabled (set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID env vars to enable)")
     print("Starting scraper...\n")
     
-    # Create and run scraper with hardcoded values
-    scraper = DiscordScraper(target_username="consτ [τ, τ]", target_server="bittensor", headless=headless, scrape_unread_only=True)
+    # Create and run scraper
+    scraper = DiscordScraper(
+        target_username="consτ [τ, τ]", 
+        target_server="bittensor", 
+        headless=headless, 
+        scrape_unread_only=True,
+        telegram_bot_token=telegram_bot_token,
+        telegram_chat_id=telegram_chat_id
+    )
     await scraper.run()
     
     # Calculate and display execution time
