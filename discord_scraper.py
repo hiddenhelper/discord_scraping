@@ -910,32 +910,24 @@ class DiscordScraper:
                     numbers = re.findall(r'\d+', name)
                     
                     if numbers:
-                        # STRICTLY check if any number is in the valid subnet range (1-128)
-                        # Only accept subnets 1-128, nothing outside this range
-                        is_subnet_channel = False
-                        subnet_number = None
-                        
-                        for num_str in numbers:
-                            try:
-                                num = int(num_str)
-                                # Only accept if number is between 1 and 128 (inclusive)
-                                if 1 <= num <= 128:
-                                    is_subnet_channel = True
-                                    subnet_number = num
-                                    break  # Use first valid subnet number found
-                            except:
-                                continue
-                        
-                        # Only add if we found a valid subnet number (1-128)
-                        if is_subnet_channel and subnet_number:
-                            channels.append({
-                                'name': name,
-                                'href': href,
-                                'element': element,
-                                'subnet_number': subnet_number
-                            })
-                            print(f"  ✓ Found subnet channel: {name} (subnet {subnet_number})")
-                        # If channel has numbers but none in 1-128 range, skip it
+                        # Use the LAST number in the channel name as the subnet identifier
+                        # Discord subnet channels have the format: "channelname・123" where 123 is the subnet
+                        # This avoids false positives from numbers embedded in names like "agents4all"
+                        try:
+                            subnet_number = int(numbers[-1])  # Get the last number
+                            
+                            # Only accept if the last number is in valid subnet range (1-128)
+                            if 1 <= subnet_number <= 128:
+                                channels.append({
+                                    'name': name,
+                                    'href': href,
+                                    'element': element,
+                                    'subnet_number': subnet_number
+                                })
+                                print(f"  ✓ Found subnet channel: {name} (subnet {subnet_number})")
+                            # If last number is outside 1-128 range, skip it
+                        except:
+                            pass
                             
                 except Exception as e:
                     continue
@@ -2182,25 +2174,6 @@ class DiscordScraper:
             traceback.print_exc()
             return False
     
-    async def save_results(self, filename: str = None):
-        """Save scraped messages to a JSON file."""
-        if filename is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"discord_messages_{self.target_username}_{timestamp}.json"
-        
-        output = {
-            'target_username': self.target_username,
-            'total_messages': len(self.messages),
-            'scraped_at': datetime.now().isoformat(),
-            'messages': self.messages
-        }
-        
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(output, f, indent=2, ensure_ascii=False)
-        
-        print(f"\n✓ Results saved to: {filename}")
-        return filename
-    
     async def send_no_messages_notification(self):
         """Send a notification to Telegram when no messages are found."""
         if not self.telegram_bot_token or not self.telegram_chat_id:
@@ -2235,25 +2208,60 @@ class DiscordScraper:
             print(f"⚠ Error sending Telegram notification: {e}")
             return False
     
-    async def run(self):
-        """Main execution method."""
+    async def run(self, check_interval: int = 10):
+        """
+        Main execution method with real-time monitoring.
+        
+        Args:
+            check_interval: Seconds to wait between scraping cycles
+        """
         try:
             await self.setup_browser()
-            await self.scrape_subnet_channels()
             
-            if self.messages:
-                await self.save_results()
-                
-                # Send to Telegram if configured
-                if self.telegram_bot_token and self.telegram_chat_id:
-                    await self.send_to_telegram()
-            else:
-                print("\n⚠ No messages found from the target user.")
-                
-                # Send "no messages" notification to Telegram if configured
-                if self.telegram_bot_token and self.telegram_chat_id:
-                    await self.send_no_messages_notification()
+            print("\n" + "="*60)
+            print("🔄 REAL-TIME MONITORING MODE")
+            print(f"   Checking for unread messages every {check_interval} seconds")
+            print("   Press Ctrl+C to stop")
+            print("="*60 + "\n")
             
+            cycle_count = 0
+            
+            while True:
+                cycle_count += 1
+                print(f"\n{'─'*60}")
+                print(f"🔍 Scrape cycle #{cycle_count} - {datetime.now().strftime('%H:%M:%S')}")
+                print(f"{'─'*60}")
+                
+                # Clear messages from previous cycle to avoid duplicates
+                self.messages = []
+                
+                # Scroll channel list back to top before scraping
+                container = await self.get_channel_list_container()
+                if container:
+                    await container.evaluate('el => el.scrollTop = 0')
+                    await asyncio.sleep(0.3)
+                
+                await self.scrape_subnet_channels()
+                
+                if self.messages:
+                    # Send to Telegram if configured
+                    if self.telegram_bot_token and self.telegram_chat_id:
+                        await self.send_to_telegram()
+                else:
+                    print("\n⚠ No messages found from the target user.")
+                    
+                    # Send "no messages" notification to Telegram if configured
+                    if self.telegram_bot_token and self.telegram_chat_id:
+                        await self.send_no_messages_notification()
+                
+                # Wait before next cycle
+                print(f"\n⏳ Next scrape in {check_interval} seconds...")
+                await asyncio.sleep(check_interval)
+            
+        except KeyboardInterrupt:
+            print("\n\n" + "="*60)
+            print("⏹ Real-time monitoring stopped by user")
+            print("="*60)
         except Exception as e:
             print(f"\n✗ Error: {e}")
             import traceback
@@ -2278,6 +2286,16 @@ async def main():
     print(f"Scraping: All subnet channels (1-128)")
     print(f"Time limit: Last 30 minutes only\n")
     
+    # Ask about check interval
+    check_interval = 10  # default
+    try:
+        interval_input = input("Check interval in seconds [default: 10]: ").strip()
+        if interval_input:
+            check_interval = int(interval_input)
+    except (EOFError, KeyboardInterrupt, ValueError):
+        print("Using default: 10 seconds")
+        check_interval = 10
+    
     # Ask about headless mode (with default to False if input fails)
     try:
         headless_input = input("Run in headless mode? (y/N): ").strip().lower()
@@ -2297,7 +2315,8 @@ async def main():
     # telegram_bot_token = "YOUR_BOT_TOKEN_HERE"
     # telegram_chat_id = "YOUR_CHAT_ID_HERE"
     
-    print(f"\nBrowser mode: {'headless' if headless else 'visible'}")
+    print(f"\nCheck interval: {check_interval} seconds")
+    print(f"Browser mode: {'headless' if headless else 'visible'}")
     if telegram_bot_token and telegram_chat_id:
         print(f"Telegram: Enabled (chat ID: {telegram_chat_id})")
     else:
@@ -2313,7 +2332,7 @@ async def main():
         telegram_bot_token=telegram_bot_token,
         telegram_chat_id=telegram_chat_id
     )
-    await scraper.run()
+    await scraper.run(check_interval=check_interval)
     
     # Calculate and display execution time
     end_time = time.time()
