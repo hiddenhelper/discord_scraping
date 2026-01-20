@@ -2255,8 +2255,8 @@ class DiscordScraper:
                     print("\n⚠ No messages found from the target user.")
                     
                     # Send "no messages" notification to Telegram if configured
-                    if self.telegram_bot_token and self.telegram_chat_id:
-                        await self.send_no_messages_notification()
+                    # if self.telegram_bot_token and self.telegram_chat_id:
+                    #     await self.send_no_messages_notification()
                 
                 # Wait before next cycle
                 print(f"\n⏳ Next scrape in {check_interval} seconds...")
