@@ -1821,6 +1821,10 @@ class DiscordScraper:
                         channel_elem = await self.page.query_selector(f'a[href*="{channel_href}"]')
                     
                     if channel_elem:
+                        # Scroll the channel into view in the sidebar before checking
+                        await channel_elem.scroll_into_view_if_needed()
+                        await asyncio.sleep(0.1)  # Brief pause for render
+                        
                         # Check if channel name is bold (unread indicator)
                         has_unread = await self.channel_has_unread(channel_elem)
                         if not has_unread:
