@@ -916,6 +916,16 @@ class DiscordScraper:
                         try:
                             subnet_number = int(numbers[-1])  # Get the last number
                             
+                            # Skip channels with "unclaimed" in the name
+                            if 'unclaimed' in name.lower():
+                                print(f"  ⏭️  Skipping unclaimed channel: {name}")
+                                continue
+                            
+                            # Skip archived channels (ending with number + "archived", like "xxx67archived")
+                            if re.search(r'\d+archived$', name.lower()):
+                                print(f"  ⏭️  Skipping archived channel: {name}")
+                                continue
+                            
                             # Only accept if the last number is in valid subnet range (1-128)
                             if 1 <= subnet_number <= 128:
                                 channels.append({
@@ -2251,6 +2261,9 @@ class DiscordScraper:
                     # Send to Telegram if configured
                     if self.telegram_bot_token and self.telegram_chat_id:
                         await self.send_to_telegram()
+                    
+                    # Clear messages after sending to prevent duplicates
+                    self.messages = []
                 else:
                     print("\n⚠ No messages found from the target user.")
                     
